@@ -469,20 +469,23 @@ class BatteryForm : Form
     }
 
     // 値 → 表示（Linux の公式ドライバーと同じ解釈：値 n は n×10〜n×10+9%）
-    void Describe(out string text, out int segments, out Color color)
+    void Describe(out string text, out int segments, out Color color, out bool bolt)
     {
+        bolt = false;
         int lv = reader.Level, st = reader.State;
         bool fresh = DateTime.UtcNow.Ticks - Interlocked.Read(ref reader.LastUpdateTicks) < TimeSpan.FromSeconds(10).Ticks;
         if (!reader.Connected || lv < 0 || !fresh)
         {
             text = reader.Connected ? "読み取り中…" : "未接続"; segments = 0; color = Color.Gray; return;
         }
-        if (st == Reader.Full) { text = "満充電"; segments = 10; color = Color.FromArgb(80, 200, 120); return; }
+        if (st == Reader.Full) { text = "FULL"; segments = 10; color = Color.FromArgb(80, 200, 120); return; }
         if (st == Reader.Error) { text = "充電エラー"; segments = 0; color = Color.OrangeRed; return; }
         segments = lv;
         if (st == Reader.Charging)
         {
-            text = lv >= 10 ? "充電中 100%" : "充電中 " + lv * 10 + "%台";
+            // 充電中の 10 は「まだ満充電ではない」＝実際は 90%台。満充電になると FULL に変わる。
+            text = lv >= 9 ? "90〜99%" : lv * 10 + "〜" + (lv * 10 + 9) + "%";
+            bolt = true;
             color = Color.FromArgb(90, 170, 255);
             return;
         }
@@ -500,14 +503,15 @@ class BatteryForm : Form
     void Render()
     {
         if (!IsHandleCreated) return;
-        string text; int seg; Color col;
-        Describe(out text, out seg, out col);
+        string text; int seg; Color col; bool bolt;
+        Describe(out text, out seg, out col, out bolt);
 
         float k = fontPt / 10f;                 // 文字の大きさに合わせて全体を拡大縮小
         // 電池の絵の幅：いまの（10マス）／コンパクト（小さい電池）／なし（文字だけ）
         float bw = batteryStyle == 0 ? 44 * k : batteryStyle == 1 ? 22 * k : 0;
         float bh = batteryStyle == 0 ? 14 * k : 11 * k;
-        int tx = batteryStyle == 2 ? (int)(10 * k) : (int)(8 * k + bw + 9 * k);
+        int bx = batteryStyle == 2 ? (int)(10 * k) : (int)(8 * k + bw + 9 * k);
+        int tx = bolt ? bx + (int)(11 * k) : bx;   // 充電中は文字の前に稲妻のマーク
         int w, h = (int)Math.Round(30 * k);
         using (var tmp = new Bitmap(1, 1))
         using (var tg = Graphics.FromImage(tmp))
@@ -555,6 +559,19 @@ class BatteryForm : Form
                             g.FillRectangle(br, body.X + 2 * k, body.Y + 2 * k, Math.Max(1.5f * k, inner * seg / 10f), body.Height - 4 * k);
                         }
                     }
+                }
+
+                if (bolt)
+                {
+                    // 稲妻のマーク（フォントに頼らず図形で描く）
+                    float cx = bx, cy = h / 2f, u = k;
+                    var pts = new[] {
+                        new PointF(cx + 5.5f * u, cy - 7 * u), new PointF(cx + 0.5f * u, cy + 1 * u),
+                        new PointF(cx + 4f * u, cy + 1 * u),   new PointF(cx + 2.5f * u, cy + 7 * u),
+                        new PointF(cx + 8.5f * u, cy - 1.5f * u), new PointF(cx + 5f * u, cy - 1.5f * u),
+                        new PointF(cx + 7f * u, cy - 7 * u) };
+                    using (var sp = new Pen(Color.FromArgb(200, 0, 0, 0), 1.5f * k)) g.DrawPolygon(sp, pts);
+                    using (var yb = new SolidBrush(Color.FromArgb(255, 210, 60))) g.FillPolygon(yb, pts);
                 }
 
                 // 文字（背景が薄くても読めるよう影を付ける）
