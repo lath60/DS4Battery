@@ -42,6 +42,7 @@ static class Hid
     [DllImport("kernel32.dll", CharSet = CharSet.Auto, SetLastError = true)]
     public static extern SafeFileHandle CreateFile(string name, uint access, uint share, IntPtr sec, uint disp, uint flags, IntPtr tmpl);
     [DllImport("kernel32.dll", SetLastError = true)] public static extern bool ReadFile(SafeFileHandle h, IntPtr buf, int len, IntPtr read, IntPtr ov);
+    [DllImport("kernel32.dll", SetLastError = true)] public static extern bool WriteFile(SafeFileHandle h, IntPtr buf, int len, IntPtr written, IntPtr ov);
     [DllImport("kernel32.dll", SetLastError = true)] public static extern bool GetOverlappedResult(SafeFileHandle h, IntPtr ov, out int read, bool wait);
     [DllImport("kernel32.dll")] public static extern bool CancelIo(SafeFileHandle h);
     [DllImport("kernel32.dll")] public static extern uint WaitForSingleObject(IntPtr h, uint ms);
@@ -84,6 +85,12 @@ class Reader
     public volatile int Level = -1;        // 0〜10（10%きざみ）
     public volatile int State;             // Discharging / Charging / Full / Error
     public volatile int RawByte = -1;      // 本体から届いた電池の欄の値（そのまま）
+    // 本体が数段階でしか残量を返さないコントローラー（Switch Pro・Xbox、どちらも試験的）
+    public volatile bool Coarse;           // その種類を読んでいる
+    public volatile int CoarseLevel = -1;  // 段階（0 がいちばん少ない）。CoarseWired＝有線で電池なし
+    public volatile string[] CoarseWords;  // 段階ごとの言葉
+    public volatile string Link = "";      // 接続の方法（Bluetooth / USB / 空＝分からない）
+    public const int CoarseWired = 100;
     public long LastUpdateTicks;
 
     public void Run()
@@ -91,7 +98,7 @@ class Reader
         while (true)
         {
             try { Session(); } catch { }
-            Connected = false; Level = -1; RawByte = -1;
+            Connected = false; Level = -1; RawByte = -1; Coarse = false; CoarseLevel = -1; Link = "";
             // 外していたときの残量は覚えておく（ケーブルをつなぐと無線から USB へつなぎ直すことがあるため）
             Thread.Sleep(3000);
         }
@@ -117,11 +124,53 @@ class Reader
             if (h.IsInvalid) h = Hid.CreateFile(path, 0x80000000, 3, IntPtr.Zero, 3, 0x40000000, IntPtr.Zero);
             if (h.IsInvalid) continue;
             var a = new Hid.HIDD_ATTRIBUTES(); a.Size = Marshal.SizeOf(a);
-            string model = Hid.HidD_GetAttributes(h, ref a) && a.VendorID == 0x054C ? ModelName(a.ProductID) : null;
+            if (!Hid.HidD_GetAttributes(h, ref a)) { h.Dispose(); continue; }
+            if (a.VendorID == 0x057E && a.ProductID == 0x2009)
+            {
+                // Switch Pro コントローラー（試験的）。Sony とは別の読み方。
+                Model = "Switch Pro コントローラー（試験的）";
+                using (h) { SwitchLoop(h); }
+                return;
+            }
+            string model = a.VendorID == 0x054C ? ModelName(a.ProductID) : null;
             if (model == null) { h.Dispose(); continue; }
             Model = model;
             using (h) { ReadLoop(h, a.ProductID == 0x0CE6 || a.ProductID == 0x0DF2); }
             return;
+        }
+        // Sony・Switch が見つからなければ Xbox（XInput）を探す
+        for (int i = 0; i < 4; i++)
+            if (XInputConnected(i)) { XboxLoop(i); return; }
+    }
+
+    // ===== Xbox コントローラー（試験的・実機では未確認）=====
+    // Windows の XInput に残量を聞くだけ（コントローラーには何も送らない）。返るのは4段階と種類だけ。
+    [StructLayout(LayoutKind.Sequential)] struct XInputBattery { public byte Type, Level; }
+    [DllImport("xinput1_4.dll")] static extern int XInputGetState(int idx, byte[] state);
+    [DllImport("xinput1_4.dll")] static extern int XInputGetBatteryInformation(int idx, byte devType, out XInputBattery info);
+
+    static bool XInputConnected(int i)
+    {
+        try { return XInputGetState(i, new byte[16]) == 0; } catch { return false; } // xinput1_4 がない古い Windows
+    }
+
+    void XboxLoop(int idx)
+    {
+        Model = "Xbox コントローラー（試験的）"; Link = ""; Bluetooth = false;
+        CoarseWords = new[] { "残りわずか", "少ない", "半分", "満タン" }; CoarseLevel = -1; Coarse = true; Level = -1; Connected = true;
+        while (XInputConnected(idx))
+        {
+            XInputBattery b;
+            if (XInputGetBatteryInformation(idx, 0 /* ゲームパッド */, out b) == 0)
+            {
+                if (b.Type == 0) return;                                  // つながっていない
+                if (b.Type == 1) { CoarseLevel = CoarseWired; Level = 10; } // 有線（電池の情報なし）
+                else if (b.Type == 0xFF || b.Level > 3) { CoarseLevel = -1; Level = -1; } // 分からない
+                else { CoarseLevel = b.Level; Level = new[] { 1, 3, 6, 10 }[b.Level]; }
+                State = Discharging; RawByte = b.Type << 4 | b.Level;
+                Interlocked.Exchange(ref LastUpdateTicks, DateTime.UtcNow.Ticks);
+            }
+            Thread.Sleep(2000);
         }
     }
 
@@ -191,6 +240,114 @@ class Reader
         finally
         {
             Marshal.FreeHGlobal(buf); Marshal.FreeHGlobal(ov); evObj.Dispose();
+        }
+    }
+
+    // ===== Switch Pro コントローラー（試験的・実機では未確認）=====
+    // 通信の仕方は Linux の公式ドライバー hid-nintendo と有志の調査（dekuNukem/Nintendo_Switch_Reverse_Engineering）による。
+    // 電池の値は入力報告 0x21・0x30・0x31 の 2 バイト目：上位3ビット＝残量（0 わずか〜4 満タン）、0x10＝充電中。
+    // Bluetooth の普段の報告（0x3F）には電池の値がないので、2秒ごとに「機器の情報を返して」（サブコマンド 0x02、
+    // 何も変えない問い合わせ）を送り、その返事（0x21）から読む。5回続けて返事がなければ送るのをやめ、聞くだけにする。
+    // USB では何も送らない（ほかのソフトが起こしたあとに届く報告だけを読む）。
+    void SwitchLoop(SafeFileHandle h)
+    {
+        IntPtr pp; var caps = new Hid.HIDP_CAPS();
+        if (!Hid.HidD_GetPreparsedData(h, out pp)) return;
+        Hid.HidP_GetCaps(pp, ref caps); Hid.HidD_FreePreparsedData(pp);
+        int len = caps.InputReportByteLength, outLen = caps.OutputReportByteLength;
+        if (len <= 0) return;
+        bool bt = len > 64;
+        Bluetooth = bt; Link = bt ? "Bluetooth" : "USB";
+        CoarseWords = new[] { "残りわずか", "少ない", "半分", "多い", "満タン" }; CoarseLevel = -1; Coarse = true; Level = -1; Connected = true;
+
+        IntPtr buf = Marshal.AllocHGlobal(len), ov = Marshal.AllocHGlobal(Marshal.SizeOf(typeof(NativeOverlapped)));
+        IntPtr obuf = outLen > 0 ? Marshal.AllocHGlobal(outLen) : IntPtr.Zero;
+        IntPtr wov = Marshal.AllocHGlobal(Marshal.SizeOf(typeof(NativeOverlapped)));
+        var evObj = new ManualResetEvent(false); var wevObj = new ManualResetEvent(false);
+        IntPtr ev = evObj.SafeWaitHandle.DangerousGetHandle(), wev = wevObj.SafeWaitHandle.DangerousGetHandle();
+        byte[] data = new byte[len];
+        int counter = 0, unanswered = 0;
+        bool pinging = bt && outLen >= 12;
+        long lastPing = 0, lastInput = DateTime.UtcNow.Ticks;
+        bool reading = false;
+        try
+        {
+            while (true)
+            {
+                long now = DateTime.UtcNow.Ticks;
+                if (pinging && now - lastPing >= TimeSpan.FromSeconds(2).Ticks)
+                {
+                    lastPing = now;
+                    if (unanswered >= 5) pinging = false; // 返事がないので送るのをやめる
+                    else
+                    {
+                        unanswered++;
+                        var pkt = new byte[outLen];
+                        pkt[0] = 0x01; pkt[1] = (byte)(counter++ & 0x0F);
+                        // 振動なし（中立の値）
+                        pkt[2] = 0x00; pkt[3] = 0x01; pkt[4] = 0x40; pkt[5] = 0x40;
+                        pkt[6] = 0x00; pkt[7] = 0x01; pkt[8] = 0x40; pkt[9] = 0x40;
+                        pkt[10] = 0x02; // サブコマンド：機器の情報を返して
+                        Marshal.Copy(pkt, 0, obuf, outLen);
+                        var wo = new NativeOverlapped(); wo.EventHandle = wev;
+                        Marshal.StructureToPtr(wo, wov, false);
+                        wevObj.Reset();
+                        int written;
+                        if (!Hid.WriteFile(h, obuf, outLen, IntPtr.Zero, wov))
+                        {
+                            int err = Marshal.GetLastWin32Error();
+                            if (err != 997) return; // 送れない＝切断
+                            if (Hid.WaitForSingleObject(wev, 1000) != 0) { Hid.CancelIo(h); Hid.GetOverlappedResult(h, wov, out written, true); return; }
+                        }
+                        if (!Hid.GetOverlappedResult(h, wov, out written, true)) return;
+                    }
+                }
+
+                if (!reading)
+                {
+                    var o = new NativeOverlapped(); o.EventHandle = ev;
+                    Marshal.StructureToPtr(o, ov, false);
+                    evObj.Reset();
+                    if (!Hid.ReadFile(h, buf, len, IntPtr.Zero, ov))
+                    {
+                        int err = Marshal.GetLastWin32Error();
+                        if (err != 997) return;
+                    }
+                    reading = true;
+                }
+                // 普段の報告はボタンを動かしたときしか来ないので、待ち切れなくても切断とはみなさない
+                if (Hid.WaitForSingleObject(ev, 500) != 0)
+                {
+                    if (DateTime.UtcNow.Ticks - lastInput > TimeSpan.FromSeconds(30).Ticks && !pinging) { Hid.CancelIo(h); int r0; Hid.GetOverlappedResult(h, ov, out r0, true); return; }
+                    continue;
+                }
+                reading = false;
+                int read;
+                if (!Hid.GetOverlappedResult(h, ov, out read, true) || read <= 0) return;
+                lastInput = DateTime.UtcNow.Ticks;
+                Marshal.Copy(buf, data, 0, Math.Min(read, len));
+                int id = data[0];
+                if ((id == 0x21 || id == 0x30 || id == 0x31) && read > 2)
+                {
+                    int b = data[2];
+                    RawByte = b;
+                    int lv = Math.Min(b >> 5, 4);
+                    CoarseLevel = lv;
+                    Level = new[] { 1, 3, 5, 7, 10 }[lv]; // 電池の絵のマス
+                    State = (b & 0x10) != 0 ? Charging : Discharging;
+                    unanswered = 0;
+                    // ほかのソフト（Steam など）が電池の値の入った報告を流しているなら、こちらからは送らない
+                    if (id != 0x21) pinging = false;
+                    Interlocked.Exchange(ref LastUpdateTicks, DateTime.UtcNow.Ticks);
+                }
+            }
+        }
+        finally
+        {
+            if (reading) { Hid.CancelIo(h); int r1; Hid.GetOverlappedResult(h, ov, out r1, true); }
+            Marshal.FreeHGlobal(buf); Marshal.FreeHGlobal(ov); Marshal.FreeHGlobal(wov);
+            if (obuf != IntPtr.Zero) Marshal.FreeHGlobal(obuf);
+            evObj.Dispose(); wevObj.Dispose();
         }
     }
 
@@ -270,6 +427,7 @@ class BatteryForm : Form
 {
     readonly Reader reader;
     Point dragStart; bool dragging;
+    ToolTip tip;
     readonly string settingsPath;
     const string RunKey = @"Software\Microsoft\Windows\CurrentVersion\Run";
     const string RunName = "DS4Battery";
@@ -395,7 +553,7 @@ class BatteryForm : Form
         menu.Opening += (s, e) => startupItem.Checked = IsStartup();
         ContextMenuStrip = menu;
 
-        var tip = new ToolTip();
+        tip = new ToolTip();
         var timer = new System.Windows.Forms.Timer { Interval = 1000 };
         timer.Tick += (s, e) =>
         {
@@ -443,6 +601,9 @@ class BatteryForm : Form
         updating = true;
         updateItem.Text = "更新しています…";
         updateItem.Enabled = false;
+        overBadge = false; Cursor = Cursors.Default;
+        Render(); // 印を消す
+        tip.SetToolTip(this, TooltipText());
         var rel = pending;
         var t = new Thread(() =>
         {
@@ -627,17 +788,41 @@ class BatteryForm : Form
         }
     }
 
+    // 更新の印（青い丸）の場所。印がないときは空。
+    RectangleF badgeRect = RectangleF.Empty;
+    bool overBadge;
+    Point locationAtDown;
+
+    bool HitBadge(Point p)
+    {
+        if (badgeRect.IsEmpty) return false;
+        var r = badgeRect; r.Inflate(3, 3); // 小さいので少し広めに受ける
+        return r.Contains(p);
+    }
+
     protected override void OnMouseDown(MouseEventArgs e)
     {
-        if (e.Button == MouseButtons.Left) { dragging = true; dragStart = e.Location; }
+        if (e.Button == MouseButtons.Left) { dragging = true; dragStart = e.Location; locationAtDown = Location; }
     }
     protected override void OnMouseMove(MouseEventArgs e)
     {
         if (dragging) Location = new Point(Location.X + e.X - dragStart.X, Location.Y + e.Y - dragStart.Y);
+        bool over = !dragging && HitBadge(e.Location);
+        Cursor = over ? Cursors.Hand : Cursors.Default;
+        if (over != overBadge) { overBadge = over; tip.SetToolTip(this, TooltipText()); }
+    }
+    protected override void OnMouseLeave(EventArgs e)
+    {
+        base.OnMouseLeave(e);
+        if (overBadge) { overBadge = false; Cursor = Cursors.Default; tip.SetToolTip(this, TooltipText()); }
     }
     protected override void OnMouseUp(MouseEventArgs e)
     {
-        if (dragging) { dragging = false; SavePosition(); }
+        if (!dragging) return;
+        dragging = false;
+        // 動かさずに印の上で離した＝印のクリック。更新を始める。
+        if (Location == locationAtDown && HitBadge(e.Location)) { StartUpdate(); return; }
+        SavePosition();
     }
 
     // 値 → 表示（Linux の公式ドライバーと同じ解釈：値 n は n×10〜n×10+9%）
@@ -651,6 +836,18 @@ class BatteryForm : Form
         if (!reader.Connected || lv < 0 || !fresh)
         {
             text = reader.Connected ? "読み取り中…" : "未接続"; segments = 0; color = Color.Gray; return;
+        }
+        if (reader.Coarse)
+        {
+            // Switch Pro・Xbox：本体が返すのは数段階だけなので、言葉で出す
+            int sl = reader.CoarseLevel; var words = reader.CoarseWords;
+            if (sl == Reader.CoarseWired) { text = "有線"; segments = 10; color = Color.FromArgb(80, 200, 120); return; }
+            if (sl < 0 || words == null || sl >= words.Length) { text = "読み取り中…"; segments = 0; color = Color.Gray; return; }
+            text = words[sl];
+            segments = lv;
+            if (st == Reader.Charging) { mark = MarkBolt; color = Color.FromArgb(90, 170, 255); return; }
+            color = sl == 0 ? Color.FromArgb(255, 70, 70) : sl == 1 ? Color.FromArgb(255, 190, 60) : Color.FromArgb(80, 200, 120);
+            return;
         }
         if (st == Reader.Full) { text = "FULL"; segments = 10; color = Color.FromArgb(80, 200, 120); return; }
         if (st == Reader.Error) { text = "充電エラー"; segments = 0; color = Color.OrangeRed; return; }
@@ -671,9 +868,13 @@ class BatteryForm : Form
 
     string TooltipText()
     {
-        string upd = pending != null && !updating ? "\n新しい版があります（v" + pending.Version + "）。右クリック →「更新する」" : "";
+        if (updating) return "更新しています…";
+        // 印の上：更新のことだけを出す
+        if (overBadge && pending != null) return "新しい版があります（v" + Updater.Current + " → v" + pending.Version + "）\nクリックすると更新します";
+        string upd = pending != null ? "\n新しい版があります（v" + pending.Version + "）。右の青い印をクリックで更新" : "";
         if (!reader.Connected) return "コントローラー未接続" + upd;
-        return reader.Model + "（" + (reader.Bluetooth ? "Bluetooth" : "USB") + "）" + upd;
+        string link = reader.Coarse ? reader.Link : (reader.Bluetooth ? "Bluetooth" : "USB");
+        return reader.Model + (link == "" ? "" : "（" + link + "）") + upd;
     }
 
     // 背景は半透明・電池の絵と文字は不透明で描く（ピクセルごとの透明度）
@@ -703,6 +904,7 @@ class BatteryForm : Form
         bool badge = pending != null && !updating;
         float bd = 12 * k, bdx = tx + textW - 1 * k;
         w = badge ? (int)(bdx + bd + 8 * k) : tx + textW + (int)(8 * k);
+        badgeRect = badge ? new RectangleF(bdx, (h - bd) / 2f, bd, bd) : RectangleF.Empty;
         if (Width != w || Height != h) Size = new Size(w, h);
 
         using (var bmp = new Bitmap(w, h, System.Drawing.Imaging.PixelFormat.Format32bppPArgb))
@@ -804,11 +1006,11 @@ class BatteryForm : Form
                     float by = (h - bd) / 2f, mx = bdx + bd / 2f, u = k;
                     using (var circle = new SolidBrush(Color.FromArgb(40, 140, 255))) g.FillEllipse(circle, bdx, by, bd, bd);
                     using (var edge = new Pen(Color.FromArgb(200, 0, 0, 0), 1.2f * k)) g.DrawEllipse(edge, bdx, by, bd, bd);
-                    using (var ar = new Pen(Color.White, 1.7f * k) { StartCap = System.Drawing.Drawing2D.LineCap.Round, EndCap = System.Drawing.Drawing2D.LineCap.Round, LineJoin = System.Drawing.Drawing2D.LineJoin.Round })
+                    using (var ar = new Pen(Color.White, 1.5f * k) { StartCap = System.Drawing.Drawing2D.LineCap.Round, EndCap = System.Drawing.Drawing2D.LineCap.Round, LineJoin = System.Drawing.Drawing2D.LineJoin.Round })
                     {
                         float cy2 = h / 2f;
-                        g.DrawLine(ar, mx, cy2 + 3.2f * u, mx, cy2 - 3.2f * u);
-                        g.DrawLines(ar, new[] { new PointF(mx - 3f * u, cy2 - 0.4f * u), new PointF(mx, cy2 - 3.4f * u), new PointF(mx + 3f * u, cy2 - 0.4f * u) });
+                        g.DrawLine(ar, mx, cy2 + 2.4f * u, mx, cy2 - 2.4f * u); // 丸のふちから 1〜2px 離す
+                        g.DrawLines(ar, new[] { new PointF(mx - 2.3f * u, cy2 - 0.2f * u), new PointF(mx, cy2 - 2.5f * u), new PointF(mx + 2.3f * u, cy2 - 0.2f * u) });
                     }
                 }
             }
@@ -857,7 +1059,7 @@ class BatteryForm : Form
 // 動いている exe は上書きできないが名前は変えられるので、今の exe を .old にして新しい exe を置く。
 static class Updater
 {
-    public const string Current = "1.4.2";
+    public const string Current = "1.4.3";
     const string Api = "https://api.github.com/repos/lath60/DS4Battery/releases/latest";
     const string AssetName = "DS4Battery.exe";
 
