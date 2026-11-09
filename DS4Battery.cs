@@ -486,9 +486,24 @@ class BatteryForm : Form
         var fontMenu = new ToolStripMenuItem("フォント");
         fontMenu.DropDownItems.Add("PC に入っているフォントから選ぶ…", null, (s, e) =>
         {
-            using (var dlg = new FontDialog { Font = Font, ShowEffects = false, FontMustExist = true, AllowVerticalFonts = false, MinSize = 6, MaxSize = 40 })
+            using (var dlg = new FontDialog { Font = Font, ShowEffects = false, FontMustExist = true, AllowVerticalFonts = false, AllowVectorFonts = false, MinSize = 6, MaxSize = 40 })
             {
-                if (dlg.ShowDialog(this) != DialogResult.OK) return;
+                // TrueType 以外（.otf の一部や昔の画面用フォント）を選ぶと、Windows の部品が例外を出す。
+                // そのときは説明を出して、もう一度選んでもらう。
+                while (true)
+                {
+                    try
+                    {
+                        if (dlg.ShowDialog(this) != DialogResult.OK) return;
+                        break;
+                    }
+                    catch (ArgumentException)
+                    {
+                        MessageBox.Show(this, "このフォントはこのアプリでは使えません（TrueType 形式のフォントだけ使えます）。\nほかのフォントを選んでください。",
+                            "コントローラーのバッテリー", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                        dlg.Font = Font;
+                    }
+                }
                 fontFamily = dlg.Font.FontFamily.Name;
                 fontStyle = dlg.Font.Style & (FontStyle.Bold | FontStyle.Italic);
                 SetFont(dlg.Font.SizeInPoints); SaveStyle(); Render();
@@ -1059,7 +1074,7 @@ class BatteryForm : Form
 // 動いている exe は上書きできないが名前は変えられるので、今の exe を .old にして新しい exe を置く。
 static class Updater
 {
-    public const string Current = "1.4.3";
+    public const string Current = "1.4.4";
     const string Api = "https://api.github.com/repos/lath60/DS4Battery/releases/latest";
     const string AssetName = "DS4Battery.exe";
 
