@@ -75,7 +75,7 @@ static class Hid
 
 class Reader
 {
-    public const int Discharging = 0, Charging = 1, Full = 2, Error = 3;
+    public const int Discharging = 0, Charging = 1, Full = 2, Error = 3, PluggedIdle = 4;
 
     // 読み取り結果（UI 側から読む）
     public volatile bool Connected;
@@ -92,6 +92,7 @@ class Reader
         {
             try { Session(); } catch { }
             Connected = false; Level = -1; RawByte = -1;
+            // 外していたときの残量は覚えておく（ケーブルをつなぐと無線から USB へつなぎ直すことがあるため）
             Thread.Sleep(3000);
         }
     }
@@ -194,12 +195,14 @@ class Reader
     }
 
     // DS4：下位4ビット＝残量、5ビット目＝ケーブル。ケーブルありで 11＝満充電、14・15＝エラー。
+    // ケーブルなしの値は 0〜9 で、ケーブルありの 0〜10 より範囲が1つ狭い。
+    // Linux の hid-sony と同じく、ケーブルなしは1段上に読む（9＝100%、8＝90%台）。
     void ParseDs4(int b)
     {
         int v = b & 0x0F; bool cable = (b & 0x10) != 0;
-        if (!cable) { State = Discharging; Level = Math.Min(v, 10); }
-        else if (v <= 10) { State = Charging; Level = v; }
-        else if (v == 11) { State = Full; Level = 10; }
+        if (!cable) OnBattery(Math.Min(v + 1, 10));
+        else if (v <= 10) OnCharging(v);
+        else if (v == 11) OnFull();
         else { State = Error; Level = 0; }
     }
 
@@ -207,10 +210,49 @@ class Reader
     void ParseDualSense(int b)
     {
         int v = Math.Min(b & 0x0F, 10), st = b >> 4;
-        if (st == 0) { State = Discharging; Level = v; }
-        else if (st == 1) { State = Charging; Level = v; }
-        else if (st == 2) { State = Full; Level = 10; }
+        if (st == 0) OnBattery(v);
+        else if (st == 1) OnCharging(v);
+        else if (st == 2) OnFull();
         else { State = Error; Level = 0; }
+    }
+
+    // 本体は残量が多いと充電を始めずに、つないだ直後から「満充電」と送ってくる。
+    // それを FULL と出すと紛らわしいので、充電が進んでから満充電になったときだけ FULL にする。
+    // そうでないときは「つないでいるが充電していない」として、外していたときの残量を出す。
+    static readonly long MinChargeTicks = TimeSpan.FromSeconds(60).Ticks;
+    int lastBatteryLevel = -1;   // ケーブルを外していたときの最後の残量
+    long lastBatteryTicks;       // その時刻
+    long chargeSince;            // 今回つないでから充電中を最初に見た時刻（0＝まだ）
+    bool trustFull;              // 今回つないでから、充電が進んで満充電になった
+    bool fullDecided;            // 今回の満充電をどちらで出すか決めた
+
+    void OnBattery(int v)
+    {
+        State = Discharging; Level = v;
+        lastBatteryLevel = v; lastBatteryTicks = DateTime.UtcNow.Ticks;
+        chargeSince = 0; trustFull = false; fullDecided = false;
+    }
+
+    void OnCharging(int v)
+    {
+        State = Charging; Level = v;
+        if (chargeSince == 0) chargeSince = DateTime.UtcNow.Ticks;
+        fullDecided = false; // 充電が始まったら、次の満充電で決め直す
+    }
+
+    void OnFull()
+    {
+        // 満充電を最初に受け取ったときに一度だけ決め、ケーブルを外すまで変えない
+        if (!fullDecided)
+        {
+            fullDecided = true;
+            long now = DateTime.UtcNow.Ticks;
+            // 外していたときの残量が分からない・古い（起動時からつないであった、10分以上前）ときは本体の判定のまま
+            trustFull = lastBatteryLevel < 0 || now - lastBatteryTicks > TimeSpan.FromMinutes(10).Ticks
+                || (chargeSince != 0 && now - chargeSince >= MinChargeTicks);
+        }
+        if (trustFull) { State = Full; Level = 10; }
+        else { State = PluggedIdle; Level = lastBatteryLevel; }
     }
 
     static void RequestFullReports(SafeFileHandle h, int featLen)
@@ -599,9 +641,11 @@ class BatteryForm : Form
     }
 
     // 値 → 表示（Linux の公式ドライバーと同じ解釈：値 n は n×10〜n×10+9%）
-    void Describe(out string text, out int segments, out Color color, out bool bolt)
+    const int MarkNone = 0, MarkBolt = 1, MarkShield = 2;
+
+    void Describe(out string text, out int segments, out Color color, out int mark)
     {
-        bolt = false;
+        mark = MarkNone;
         int lv = reader.Level, st = reader.State;
         bool fresh = DateTime.UtcNow.Ticks - Interlocked.Read(ref reader.LastUpdateTicks) < TimeSpan.FromSeconds(10).Ticks;
         if (!reader.Connected || lv < 0 || !fresh)
@@ -615,37 +659,50 @@ class BatteryForm : Form
         {
             // 充電中の 10 は「まだ満充電ではない」＝実際は 90%台。満充電になると FULL に変わる。
             text = lv >= 9 ? "90〜99%" : lv * 10 + "〜" + (lv * 10 + 9) + "%";
-            bolt = true;
+            mark = MarkBolt;
             color = Color.FromArgb(90, 170, 255);
             return;
         }
+        // つないでいるが本体が充電していない（充電しすぎを防いでいる）：盾＋チェックと外していたときの残量
+        if (st == Reader.PluggedIdle) mark = MarkShield;
         text = lv >= 10 ? "100%" : lv * 10 + "〜" + (lv * 10 + 9) + "%";
         color = lv <= 1 ? Color.FromArgb(255, 70, 70) : lv <= 3 ? Color.FromArgb(255, 190, 60) : Color.FromArgb(80, 200, 120);
     }
 
     string TooltipText()
     {
-        if (!reader.Connected) return "コントローラー未接続";
-        return reader.Model + "（" + (reader.Bluetooth ? "Bluetooth" : "USB") + "）";
+        string upd = pending != null && !updating ? "\n新しい版があります（v" + pending.Version + "）。右クリック →「更新する」" : "";
+        if (!reader.Connected) return "コントローラー未接続" + upd;
+        return reader.Model + "（" + (reader.Bluetooth ? "Bluetooth" : "USB") + "）" + upd;
     }
 
     // 背景は半透明・電池の絵と文字は不透明で描く（ピクセルごとの透明度）
     void Render()
     {
         if (!IsHandleCreated) return;
-        string text; int seg; Color col; bool bolt;
-        Describe(out text, out seg, out col, out bolt);
+        string text; int seg; Color col; int mark;
+        Describe(out text, out seg, out col, out mark);
+        bool bolt = mark == MarkBolt;
 
         float k = fontPt / 10f;                 // 文字の大きさに合わせて全体を拡大縮小
         // 電池の絵の幅：いまの（10マス）／コンパクト（小さい電池）／なし（文字だけ）
         float bw = batteryStyle == 0 ? 44 * k : batteryStyle == 1 ? 22 * k : 0;
         float bh = batteryStyle == 0 ? 14 * k : 11 * k;
         int bx = batteryStyle == 2 ? (int)(10 * k) : (int)(8 * k + bw + 9 * k);
-        int tx = bolt ? bx + (int)(11 * k) : bx;   // 充電中は文字の前に稲妻のマーク
-        int w, h = (int)Math.Round(30 * k);
+        // 充電中は稲妻、つないで充電していないとき（充電しすぎを防いでいる）は盾＋チェック
+        // 電池の絵があるときはマークを電池の上に重ね、絵がないときは文字の前に置く
+        bool overlay = batteryStyle != 2;
+        int tx = overlay ? bx : mark == MarkBolt ? bx + (int)(11 * k) : mark == MarkShield ? bx + (int)(14 * k) : bx;
+        float markC = overlay ? 8 * k + bw / 2f : bx + 4.5f * k;          // マークの中心の x
+        float mu = overlay && batteryStyle == 1 ? 0.85f * k : k;          // コンパクトの電池は小さいので少し縮める
+        int w, h = (int)Math.Round(30 * k), textW;
         using (var tmp = new Bitmap(1, 1))
         using (var tg = Graphics.FromImage(tmp))
-            w = tx + (int)tg.MeasureString(text, Font).Width + (int)(8 * k);
+            textW = (int)tg.MeasureString(text, Font).Width;
+        // 新しい版があるときは、文字の右に小さな印（青い丸に上向きの矢印）を出す
+        bool badge = pending != null && !updating;
+        float bd = 12 * k, bdx = tx + textW - 1 * k;
+        w = badge ? (int)(bdx + bd + 8 * k) : tx + textW + (int)(8 * k);
         if (Width != w || Height != h) Size = new Size(w, h);
 
         using (var bmp = new Bitmap(w, h, System.Drawing.Imaging.PixelFormat.Format32bppPArgb))
@@ -694,7 +751,7 @@ class BatteryForm : Form
                 if (bolt)
                 {
                     // 稲妻のマーク（フォントに頼らず図形で描く）
-                    float cx = bx, cy = h / 2f, u = k;
+                    float u = mu, cx = markC - 4.5f * u, cy = h / 2f;
                     var pts = new[] {
                         new PointF(cx + 5.5f * u, cy - 7 * u), new PointF(cx + 0.5f * u, cy + 1 * u),
                         new PointF(cx + 4f * u, cy + 1 * u),   new PointF(cx + 2.5f * u, cy + 7 * u),
@@ -703,6 +760,37 @@ class BatteryForm : Form
                     using (var sp = new Pen(Color.FromArgb(200, 0, 0, 0), 1.5f * k)) g.DrawPolygon(sp, pts);
                     using (var yb = new SolidBrush(Color.FromArgb(255, 210, 60))) g.FillPolygon(yb, pts);
                 }
+                else if (mark == MarkShield)
+                {
+                    // 盾＋チェック（充電しすぎを防いでいる＝大丈夫）。幅 13 前後、中心は bx+5。
+                    float u = mu, c = overlay ? markC : bx + 5 * k, cy = h / 2f, sx = 1.4f;
+                    Func<float, float, PointF> P = (x, y) => new PointF(c + x * sx * u, cy + y * u);
+                    if (overlay)
+                    {
+                        // 電池に重ねるときは盾を外し、黒いふち付きの白いチェックだけ（緑の電池に緑の盾は見分けにくい）
+                        float cu = batteryStyle == 1 ? 0.85f * k : k;
+                        Func<float, float, PointF> Q = (x, y) => new PointF(c + x * cu, cy + y * cu);
+                        var pts = new[] { Q(-3.6f, 0f), Q(-1f, 2.8f), Q(3.8f, -3f) };
+                        var round = System.Drawing.Drawing2D.LineCap.Round; var rj = System.Drawing.Drawing2D.LineJoin.Round;
+                        using (var ol = new Pen(Color.FromArgb(220, 0, 0, 0), 4.2f * cu) { StartCap = round, EndCap = round, LineJoin = rj }) g.DrawLines(ol, pts);
+                        using (var ck = new Pen(Color.White, 2.2f * cu) { StartCap = round, EndCap = round, LineJoin = rj }) g.DrawLines(ck, pts);
+                    }
+                    else
+                    {
+                    using (var sh = new System.Drawing.Drawing2D.GraphicsPath())
+                    {
+                        sh.AddLines(new[] { P(0, -7), P(4.5f, -5), P(4.5f, -1) });
+                        sh.AddBezier(P(4.5f, -1), P(4.5f, 3.5f), P(2, 6), P(0, 7));
+                        sh.AddBezier(P(0, 7), P(-2, 6), P(-4.5f, 3.5f), P(-4.5f, -1));
+                        sh.AddLines(new[] { P(-4.5f, -1), P(-4.5f, -5) });
+                        sh.CloseFigure();
+                        using (var sp = new Pen(Color.FromArgb(200, 0, 0, 0), 1.5f * k)) g.DrawPath(sp, sh);
+                        using (var gb = new SolidBrush(Color.FromArgb(80, 200, 120))) g.FillPath(gb, sh);
+                    }
+                    using (var ck = new Pen(Color.White, 1.7f * k) { StartCap = System.Drawing.Drawing2D.LineCap.Round, EndCap = System.Drawing.Drawing2D.LineCap.Round, LineJoin = System.Drawing.Drawing2D.LineJoin.Round })
+                        g.DrawLines(ck, new[] { P(-2.2f, 0.2f), P(-0.5f, 2.2f), P(2.3f, -2.5f) });
+                    }
+                }
 
                 // 文字（背景が薄くても読めるよう影を付ける）
                 var sz = g.MeasureString(text, Font);
@@ -710,6 +798,19 @@ class BatteryForm : Form
                 Color fc = col == Color.Gray ? Color.Silver : textColor.IsEmpty ? col : textColor;
                 using (var sh = new SolidBrush(Color.FromArgb(200, 0, 0, 0))) g.DrawString(text, Font, sh, tx + 1, ty + 1);
                 using (var br = new SolidBrush(fc)) g.DrawString(text, Font, br, tx, ty);
+
+                if (badge)
+                {
+                    float by = (h - bd) / 2f, mx = bdx + bd / 2f, u = k;
+                    using (var circle = new SolidBrush(Color.FromArgb(40, 140, 255))) g.FillEllipse(circle, bdx, by, bd, bd);
+                    using (var edge = new Pen(Color.FromArgb(200, 0, 0, 0), 1.2f * k)) g.DrawEllipse(edge, bdx, by, bd, bd);
+                    using (var ar = new Pen(Color.White, 1.7f * k) { StartCap = System.Drawing.Drawing2D.LineCap.Round, EndCap = System.Drawing.Drawing2D.LineCap.Round, LineJoin = System.Drawing.Drawing2D.LineJoin.Round })
+                    {
+                        float cy2 = h / 2f;
+                        g.DrawLine(ar, mx, cy2 + 3.2f * u, mx, cy2 - 3.2f * u);
+                        g.DrawLines(ar, new[] { new PointF(mx - 3f * u, cy2 - 0.4f * u), new PointF(mx, cy2 - 3.4f * u), new PointF(mx + 3f * u, cy2 - 0.4f * u) });
+                    }
+                }
             }
 
             IntPtr screen = GetDC(IntPtr.Zero), mem = CreateCompatibleDC(screen);
@@ -756,7 +857,7 @@ class BatteryForm : Form
 // 動いている exe は上書きできないが名前は変えられるので、今の exe を .old にして新しい exe を置く。
 static class Updater
 {
-    public const string Current = "1.4.1";
+    public const string Current = "1.4.2";
     const string Api = "https://api.github.com/repos/lath60/DS4Battery/releases/latest";
     const string AssetName = "DS4Battery.exe";
 

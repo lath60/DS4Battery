@@ -1,2 +1,4 @@
 *.exe
 使い方.txt
+*.exe.old
+*.exe.new
