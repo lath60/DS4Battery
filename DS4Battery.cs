@@ -486,27 +486,14 @@ class BatteryForm : Form
         var fontMenu = new ToolStripMenuItem("フォント");
         fontMenu.DropDownItems.Add("PC に入っているフォントから選ぶ…", null, (s, e) =>
         {
-            using (var dlg = new FontDialog { Font = Font, ShowEffects = false, FontMustExist = true, AllowVerticalFonts = false, AllowVectorFonts = false, MinSize = 6, MaxSize = 40 })
+            // Windows のフォントの画面は、このアプリで描けないフォント（.otf の一部など）も並べてしまい、
+            // 選ぶと例外になる。描けるフォントだけを並べる自前の画面を使う。
+            using (var dlg = new FontPicker(fontFamily, fontPt, fontStyle))
             {
-                // TrueType 以外（.otf の一部や昔の画面用フォント）を選ぶと、Windows の部品が例外を出す。
-                // そのときは説明を出して、もう一度選んでもらう。
-                while (true)
-                {
-                    try
-                    {
-                        if (dlg.ShowDialog(this) != DialogResult.OK) return;
-                        break;
-                    }
-                    catch (ArgumentException)
-                    {
-                        MessageBox.Show(this, "このフォントはこのアプリでは使えません（TrueType 形式のフォントだけ使えます）。\nほかのフォントを選んでください。",
-                            "コントローラーのバッテリー", MessageBoxButtons.OK, MessageBoxIcon.Information);
-                        dlg.Font = Font;
-                    }
-                }
-                fontFamily = dlg.Font.FontFamily.Name;
-                fontStyle = dlg.Font.Style & (FontStyle.Bold | FontStyle.Italic);
-                SetFont(dlg.Font.SizeInPoints); SaveStyle(); Render();
+                if (dlg.ShowDialog(this) != DialogResult.OK) return;
+                fontFamily = dlg.Family;
+                fontStyle = dlg.Style;
+                SetFont(dlg.SizePt); SaveStyle(); Render();
             }
         });
         fontMenu.DropDownItems.Add("最初のフォントに戻す", null, (s, e) => { fontFamily = DefaultFamily; fontStyle = FontStyle.Bold; SetFont(fontPt); SaveStyle(); Render(); });
@@ -1074,7 +1061,7 @@ class BatteryForm : Form
 // 動いている exe は上書きできないが名前は変えられるので、今の exe を .old にして新しい exe を置く。
 static class Updater
 {
-    public const string Current = "1.4.4";
+    public const string Current = "1.4.5";
     const string Api = "https://api.github.com/repos/lath60/DS4Battery/releases/latest";
     const string AssetName = "DS4Battery.exe";
 
@@ -1248,4 +1235,146 @@ static class Updater
     }
 
     static void TryDelete(string p) { try { if (File.Exists(p)) File.Delete(p); } catch { } }
+}
+
+// フォントを選ぶ画面。GDI+ が扱えるフォント（InstalledFontCollection に入るもの）だけを並べるので、
+// 選んだあとに「TrueType ではない」で落ちることがない。
+class FontPicker : Form
+{
+    public string Family { get; private set; }
+    public float SizePt { get; private set; }
+    public FontStyle Style { get; private set; }
+
+    readonly ListBox list = new ListBox();
+    readonly TextBox search = new TextBox();
+    readonly NumericUpDown size = new NumericUpDown();
+    readonly CheckBox bold = new CheckBox(), italic = new CheckBox();
+    readonly Label preview = new Label();
+    readonly FontFamily[] all;
+    readonly System.Collections.Generic.Dictionary<string, Font> cache = new System.Collections.Generic.Dictionary<string, Font>();
+
+    public FontPicker(string family, float pt, FontStyle style)
+    {
+        Text = "フォントを選ぶ";
+        Font = new Font("Yu Gothic UI", 9f);
+        FormBorderStyle = FormBorderStyle.FixedDialog;
+        MaximizeBox = MinimizeBox = false; ShowInTaskbar = false; TopMost = true;
+        StartPosition = FormStartPosition.CenterScreen;
+        AutoScaleMode = AutoScaleMode.Dpi;
+        ClientSize = new Size(460, 470);
+
+        using (var ifc = new System.Drawing.Text.InstalledFontCollection())
+        {
+            var usable = new System.Collections.Generic.List<FontFamily>();
+            foreach (var f in ifc.Families)
+                if (f.IsStyleAvailable(FontStyle.Regular) || f.IsStyleAvailable(FontStyle.Bold)) usable.Add(f);
+            all = usable.ToArray();
+        }
+
+        var findLabel = new Label { Text = "名前で探す", Location = new Point(12, 14), AutoSize = true };
+        search.Location = new Point(90, 10); search.Width = 358;
+        search.TextChanged += (s, e) => Fill(null);
+
+        list.Location = new Point(12, 40); list.Size = new Size(436, 250);
+        list.DrawMode = DrawMode.OwnerDrawFixed; list.ItemHeight = 26; list.IntegralHeight = false;
+        list.DrawItem += DrawItem;
+        list.SelectedIndexChanged += (s, e) => UpdatePreview();
+        list.DoubleClick += (s, e) => { if (list.SelectedItem != null) Accept(); };
+
+        var sizeLabel = new Label { Text = "大きさ", Location = new Point(12, 304), AutoSize = true };
+        size.Location = new Point(70, 300); size.Width = 70; size.DecimalPlaces = 1; size.Increment = 0.5m;
+        size.Minimum = 6; size.Maximum = 40; size.Value = (decimal)Math.Max(6f, Math.Min(40f, pt));
+        size.ValueChanged += (s, e) => UpdatePreview();
+        bold.Text = "太字"; bold.Location = new Point(165, 302); bold.AutoSize = true; bold.Checked = (style & FontStyle.Bold) != 0;
+        italic.Text = "斜体"; italic.Location = new Point(235, 302); italic.AutoSize = true; italic.Checked = (style & FontStyle.Italic) != 0;
+        bold.CheckedChanged += (s, e) => UpdatePreview();
+        italic.CheckedChanged += (s, e) => UpdatePreview();
+
+        preview.Location = new Point(12, 334); preview.Size = new Size(436, 86);
+        preview.BorderStyle = BorderStyle.FixedSingle; preview.TextAlign = ContentAlignment.MiddleCenter;
+        preview.BackColor = Color.FromArgb(40, 40, 40); preview.ForeColor = Color.White;
+
+        var ok = new Button { Text = "OK", Location = new Point(276, 432), Size = new Size(80, 28) };
+        var cancel = new Button { Text = "キャンセル", Location = new Point(368, 432), Size = new Size(80, 28), DialogResult = DialogResult.Cancel };
+        ok.Click += (s, e) => { if (list.SelectedItem != null) Accept(); };
+        AcceptButton = ok; CancelButton = cancel;
+
+        Controls.AddRange(new Control[] { findLabel, search, list, sizeLabel, size, bold, italic, preview, ok, cancel });
+        Fill(family);
+    }
+
+    void Fill(string select)
+    {
+        var cur = list.SelectedItem as FontFamily; string keep = select ?? (cur != null ? cur.Name : null);
+        string q = search.Text.Trim();
+        list.BeginUpdate();
+        list.Items.Clear();
+        foreach (var f in all)
+            if (q.Length == 0 || f.Name.IndexOf(q, StringComparison.OrdinalIgnoreCase) >= 0) list.Items.Add(f);
+        list.EndUpdate();
+        for (int i = 0; i < list.Items.Count; i++)
+            if (string.Equals(((FontFamily)list.Items[i]).Name, keep, StringComparison.OrdinalIgnoreCase)) { list.SelectedIndex = i; break; }
+        if (list.SelectedIndex < 0 && list.Items.Count > 0 && select != null) list.SelectedIndex = 0;
+        UpdatePreview();
+    }
+
+    static FontStyle Usable(FontFamily f, FontStyle want)
+    {
+        foreach (var s in new[] { want, want & ~FontStyle.Italic, want & ~FontStyle.Bold, FontStyle.Regular, FontStyle.Bold, FontStyle.Italic, FontStyle.Bold | FontStyle.Italic })
+            if (f.IsStyleAvailable(s)) return s;
+        return FontStyle.Regular;
+    }
+
+    Font Sample(FontFamily f)
+    {
+        Font ft;
+        if (cache.TryGetValue(f.Name, out ft)) return ft;
+        try { ft = new Font(f, 11f, Usable(f, FontStyle.Regular)); } catch { ft = Font; }
+        cache[f.Name] = ft;
+        return ft;
+    }
+
+    void DrawItem(object sender, DrawItemEventArgs e)
+    {
+        e.DrawBackground();
+        if (e.Index < 0) return;
+        var f = (FontFamily)list.Items[e.Index];
+        Color fg = (e.State & DrawItemState.Selected) != 0 ? SystemColors.HighlightText : SystemColors.ControlText;
+        var r = e.Bounds;
+        TextRenderer.DrawText(e.Graphics, f.Name, Font, new Rectangle(r.X + 4, r.Y, 200, r.Height), fg,
+            TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
+        TextRenderer.DrawText(e.Graphics, "50〜59%  FULL", Sample(f), new Rectangle(r.X + 210, r.Y, r.Width - 214, r.Height), fg,
+            TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
+    }
+
+    FontStyle Wanted() { return (bold.Checked ? FontStyle.Bold : 0) | (italic.Checked ? FontStyle.Italic : 0); }
+
+    void UpdatePreview()
+    {
+        var f = list.SelectedItem as FontFamily;
+        if (f == null) { preview.Text = ""; return; }
+        try
+        {
+            var old = preview.Font;
+            preview.Font = new Font(f, (float)size.Value, Usable(f, Wanted()));
+            if (old != Font) old.Dispose();
+            preview.Text = "50〜59%  FULL";
+        }
+        catch { preview.Text = "（このフォントは表示できません）"; }
+    }
+
+    void Accept()
+    {
+        var f = (FontFamily)list.SelectedItem;
+        Family = f.Name;
+        SizePt = (float)size.Value;
+        Style = Usable(f, Wanted()) & (FontStyle.Bold | FontStyle.Italic);
+        DialogResult = DialogResult.OK;
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing) { foreach (var ft in cache.Values) if (ft != Font) ft.Dispose(); cache.Clear(); }
+        base.Dispose(disposing);
+    }
 }
