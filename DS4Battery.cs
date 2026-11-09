@@ -337,7 +337,19 @@ class BatteryForm : Form
         startupItem = new ToolStripMenuItem("Windows の起動時に自動で開く", null, (s, e) => ToggleStartup());
         menu.Items.Add(startupItem);
         menu.Items.Add(new ToolStripSeparator());
+        var verItem = new ToolStripMenuItem("DS4Battery v" + Updater.Current) { Enabled = false };
+        menu.Items.Add(verItem);
         menu.Items.Add("終了", null, (s, e) => Close());
+
+        // 新しい版の確認：起動の30秒後と、その後24時間ごと。見つかったらメニューのいちばん上に出す。
+        updateItem = new ToolStripMenuItem { Visible = false, Font = new Font(menu.Font, FontStyle.Bold) };
+        updateItem.Click += (s, e) => StartUpdate();
+        menu.Items.Insert(0, updateItem);
+        updateSep = new ToolStripSeparator { Visible = false };
+        menu.Items.Insert(1, updateSep);
+        var updTimer = new System.Windows.Forms.Timer { Interval = 30 * 1000 };
+        updTimer.Tick += (s, e) => { updTimer.Interval = 24 * 60 * 60 * 1000; CheckUpdateInBackground(); };
+        updTimer.Start();
         menu.Opening += (s, e) => startupItem.Checked = IsStartup();
         ContextMenuStrip = menu;
 
@@ -357,8 +369,57 @@ class BatteryForm : Form
         get { var cp = base.CreateParams; cp.ExStyle |= 0x80 /* TOOLWINDOW: Alt+Tab に出さない */ | 0x80000 /* LAYERED: 背景だけ半透明 */; return cp; }
     }
 
+    ToolStripMenuItem updateItem;
+    ToolStripSeparator updateSep;
+    Updater.Release pending;
+    bool updating;
+
+    void CheckUpdateInBackground()
+    {
+        if (updating) return;
+        var t = new Thread(() =>
+        {
+            var rel = Updater.FindNewer();
+            if (rel == null) return;
+            try
+            {
+                BeginInvoke((Action)(() =>
+                {
+                    pending = rel;
+                    updateItem.Text = "新しい版があります（v" + rel.Version + "）→ 更新する";
+                    updateItem.Visible = updateSep.Visible = true;
+                }));
+            }
+            catch { }
+        }) { IsBackground = true };
+        t.Start();
+    }
+
+    void StartUpdate()
+    {
+        if (pending == null || updating) return;
+        updating = true;
+        updateItem.Text = "更新しています…";
+        updateItem.Enabled = false;
+        var rel = pending;
+        var t = new Thread(() =>
+        {
+            string err = Updater.Apply(rel);
+            BeginInvoke((Action)(() =>
+            {
+                if (err == null) { Updater.LaunchNew(); Close(); return; }
+                updating = false;
+                updateItem.Enabled = true;
+                updateItem.Text = "新しい版があります（v" + rel.Version + "）→ 更新する";
+                MessageBox.Show("更新できませんでした。今の版のまま使えます。\n" + err +
+                    "\n\n手で更新するときは GitHub の Releases から DS4Battery.exe を落としてください。", "DS4Battery");
+            }));
+        }) { IsBackground = true };
+        t.Start();
+    }
+
     int bgAlpha = 130;
-    int batteryStyle = 0;               // 0 いまの（10マス）／1 コンパクト／2 電池の絵なし
+    int batteryStyle = 0;              // 0 いまの（10マス）／1 コンパクト／2 電池の絵なし
 
     string BatteryPath { get { return Path.Combine(Path.GetDirectoryName(settingsPath), "battery.txt"); } }
 
@@ -663,18 +724,163 @@ class BatteryForm : Form
     }
 
     [STAThread]
-    static void Main()
+    static void Main(string[] args)
     {
-        bool created;
-        using (var m = new Mutex(true, "DS4Battery_single_instance", out created))
+        // 更新の直後は、古い版が閉じるのを少し待つ
+        bool afterUpdate = Array.IndexOf(args, "--after-update") >= 0;
+        using (var m = new Mutex(false, "DS4Battery_single_instance"))
         {
-            if (!created) return; // 2つ目は開かない
-            Application.EnableVisualStyles();
-            BatteryForm.RefreshStartup();
-            var r = new Reader();
-            var t = new Thread(r.Run) { IsBackground = true };
-            t.Start();
-            Application.Run(new BatteryForm(r));
+            bool got;
+            try { got = m.WaitOne(afterUpdate ? 15000 : 0); }
+            catch (AbandonedMutexException) { got = true; }
+            if (!got) return; // 2つ目は開かない
+            try
+            {
+                Updater.Cleanup();
+                Application.EnableVisualStyles();
+                BatteryForm.RefreshStartup();
+                var r = new Reader();
+                var t = new Thread(r.Run) { IsBackground = true };
+                t.Start();
+                Application.Run(new BatteryForm(r));
+            }
+            finally { m.ReleaseMutex(); }
         }
     }
+}
+
+// GitHub の最新リリースを見て、新しい版の exe に入れ替える。
+// 動いている exe は上書きできないが名前は変えられるので、今の exe を .old にして新しい exe を置く。
+static class Updater
+{
+    public const string Current = "1.4.0";
+    const string Api = "https://api.github.com/repos/lath60/DS4Battery/releases/latest";
+    const string AssetName = "DS4Battery.exe";
+
+    public class Release { public string Version, ApiUrl, Url, Sha256; public long Size; }
+
+    static string Exe { get { return Application.ExecutablePath; } }
+
+    static System.Net.WebClient Client()
+    {
+        System.Net.ServicePointManager.SecurityProtocol |= (System.Net.SecurityProtocolType)3072; // TLS 1.2
+        var wc = new System.Net.WebClient();
+        wc.Headers[System.Net.HttpRequestHeader.UserAgent] = "DS4Battery-updater";
+        wc.Encoding = System.Text.Encoding.UTF8;
+        return wc;
+    }
+
+    // 新しい版があれば返す。無いとき・確かめられないときは null。
+    public static Release FindNewer()
+    {
+        try
+        {
+            string json;
+            using (var wc = Client()) json = wc.DownloadString(Api);
+            var tag = System.Text.RegularExpressions.Regex.Match(json, "\"tag_name\"\\s*:\\s*\"v?([0-9.]+)\"");
+            if (!tag.Success || new Version(tag.Groups[1].Value) <= new Version(Current)) return null;
+
+            int i = json.IndexOf("\"name\":\"" + AssetName + "\"", StringComparison.Ordinal);
+            if (i < 0) return null;
+            int end = json.IndexOf("\"browser_download_url\"", i, StringComparison.Ordinal);
+            if (end < 0) return null;
+            string asset = json.Substring(i, end - i);
+            var url = System.Text.RegularExpressions.Regex.Match(json.Substring(end), "^\"browser_download_url\"\\s*:\\s*\"([^\"]+)\"");
+            var size = System.Text.RegularExpressions.Regex.Match(asset, "\"size\"\\s*:\\s*(\\d+)");
+            var sha = System.Text.RegularExpressions.Regex.Match(asset, "\"digest\"\\s*:\\s*\"sha256:([0-9a-fA-F]{64})\"");
+            if (!url.Success || !size.Success) return null;
+            if (!url.Groups[1].Value.StartsWith("https://github.com/lath60/DS4Battery/releases/download/", StringComparison.Ordinal)) return null;
+            // 同じファイルの API 側の取得口（"url" は "name" より前にある）。通常の取得口が止まることがあるので先に使う。
+            const string apiPrefix = "\"url\":\"https://api.github.com/repos/lath60/DS4Battery/releases/assets/";
+            int a = json.LastIndexOf(apiPrefix, i, StringComparison.Ordinal);
+            string apiUrl = null;
+            if (a >= 0)
+            {
+                var m = System.Text.RegularExpressions.Regex.Match(json.Substring(a), "^\"url\":\"(https://api\\.github\\.com/repos/lath60/DS4Battery/releases/assets/\\d+)\"");
+                if (m.Success) apiUrl = m.Groups[1].Value;
+            }
+            return new Release
+            {
+                Version = tag.Groups[1].Value,
+                ApiUrl = apiUrl,
+                Url = url.Groups[1].Value,
+                Size = long.Parse(size.Groups[1].Value),
+                Sha256 = sha.Success ? sha.Groups[1].Value.ToLowerInvariant() : null,
+            };
+        }
+        catch { return null; }
+    }
+
+    // 入れ替えまで行う。うまくいけば null、だめならその理由（元の exe はそのまま残す）。
+    public static string Apply(Release rel)
+    {
+        string exe = Exe, neu = exe + ".new", old = exe + ".old";
+        try
+        {
+            if (File.Exists(neu)) File.Delete(neu);
+            bool ok = false;
+            if (rel.ApiUrl != null)
+            {
+                try
+                {
+                    using (var wc = Client())
+                    {
+                        wc.Headers[System.Net.HttpRequestHeader.Accept] = "application/octet-stream";
+                        wc.DownloadFile(rel.ApiUrl, neu);
+                    }
+                    ok = true;
+                }
+                catch { }
+            }
+            if (!ok) using (var wc = Client()) wc.DownloadFile(rel.Url, neu);
+
+            var bytes = File.ReadAllBytes(neu);
+            if (bytes.Length != rel.Size || bytes.Length < 2 || bytes[0] != 'M' || bytes[1] != 'Z')
+                throw new Exception("落としたファイルが壊れています。");
+            if (rel.Sha256 != null)
+            {
+                using (var h = System.Security.Cryptography.SHA256.Create())
+                    if (BitConverter.ToString(h.ComputeHash(bytes)).Replace("-", "").ToLowerInvariant() != rel.Sha256)
+                        throw new Exception("落としたファイルが GitHub の記録と一致しません。");
+            }
+
+            if (File.Exists(old)) File.Delete(old);
+            File.Move(exe, old);
+            try { File.Move(neu, exe); }
+            catch { File.Move(old, exe); throw; }
+            return null;
+        }
+        catch (UnauthorizedAccessException)
+        {
+            TryDelete(neu);
+            return "この場所には書き込めません（" + Path.GetDirectoryName(exe) + "）。";
+        }
+        catch (Exception ex)
+        {
+            TryDelete(neu);
+            return ex.Message;
+        }
+    }
+
+    public static void LaunchNew()
+    {
+        System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(Exe, "--after-update") { UseShellExecute = false });
+    }
+
+    // 前の更新で残った古い exe を消す（古い版が閉じきるまで少し待つ）
+    public static void Cleanup()
+    {
+        var t = new Thread(() =>
+        {
+            for (int n = 0; n < 20; n++)
+            {
+                if (!File.Exists(Exe + ".old") && !File.Exists(Exe + ".new")) return;
+                TryDelete(Exe + ".old"); TryDelete(Exe + ".new");
+                Thread.Sleep(500);
+            }
+        }) { IsBackground = true };
+        t.Start();
+    }
+
+    static void TryDelete(string p) { try { if (File.Exists(p)) File.Delete(p); } catch { } }
 }
