@@ -65,7 +65,7 @@ C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /nologo /target:winexe /
 
 ## 設定の保存場所
 
-`%APPDATA%\DS4Battery\` に位置・背景の濃さ・文字の設定を保存します。消せば最初の状態に戻ります。自動起動はレジストリ `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` の `DS4Battery` です（メニューから外せます）。
+`%APPDATA%\DS4Battery\` に位置・背景の濃さ・文字の設定を保存します。消せば最初の状態に戻ります。自動起動はタスク スケジューラの `DS4Battery`（ログオンの10秒後に起動）です（メニューから外せます）。前の版で使っていたレジストリの Run の登録は、新しい版を一度起動すると自動でタスクへ移ります（Run の登録は Windows の起動時に飛ばされることがあったため）。
 
 ## ライセンス
 

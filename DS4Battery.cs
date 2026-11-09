@@ -441,17 +441,85 @@ class BatteryForm : Form
         catch { }
     }
 
-    bool IsStartup()
+    // 自動起動はタスク スケジューラの「ログオン時」で行う。
+    // レジストリの Run は Windows の起動処理で飛ばされることがあるため（実機で確認）。
+    // 自分のログオンだけのタスクなので管理者の権限は要らない。
+    const string TaskName = "DS4Battery";
+
+    static object Com(object o, string name, params object[] args)
+    {
+        return o.GetType().InvokeMember(name, System.Reflection.BindingFlags.InvokeMethod, null, o, args);
+    }
+
+    static object TaskFolder()
+    {
+        var svc = Activator.CreateInstance(Type.GetTypeFromProgID("Schedule.Service"));
+        Com(svc, "Connect");
+        return Com(svc, "GetFolder", "\\");
+    }
+
+    static bool HasTask()
+    {
+        try { Com(TaskFolder(), "GetTask", TaskName); return true; } catch { return false; }
+    }
+
+    static bool HasRunValue()
     {
         using (var k = Registry.CurrentUser.OpenSubKey(RunKey)) return k != null && k.GetValue(RunName) != null;
     }
 
+    static void DeleteRunValue()
+    {
+        using (var k = Registry.CurrentUser.OpenSubKey(RunKey, true)) if (k != null && k.GetValue(RunName) != null) k.DeleteValue(RunName);
+    }
+
+    static void RegisterTask()
+    {
+        string user = System.Security.SecurityElement.Escape(Environment.UserDomainName + "\\" + Environment.UserName);
+        string exe = System.Security.SecurityElement.Escape(Application.ExecutablePath);
+        string xml =
+            "<?xml version=\"1.0\" encoding=\"UTF-16\"?>" +
+            "<Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">" +
+            "<RegistrationInfo><Description>コントローラーのバッテリー残量を表示（DS4Battery）</Description></RegistrationInfo>" +
+            "<Triggers><LogonTrigger><Enabled>true</Enabled><UserId>" + user + "</UserId><Delay>PT10S</Delay></LogonTrigger></Triggers>" +
+            "<Principals><Principal id=\"Author\"><UserId>" + user + "</UserId><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>" +
+            "<Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>" +
+            "<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries><StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>" +
+            "<ExecutionTimeLimit>PT0S</ExecutionTimeLimit><Priority>5</Priority><AllowStartOnDemand>true</AllowStartOnDemand></Settings>" +
+            "<Actions Context=\"Author\"><Exec><Command>" + exe + "</Command></Exec></Actions></Task>";
+        // 6 = 作成または更新、3 = ログオン中のユーザーとして実行
+        Com(TaskFolder(), "RegisterTask", TaskName, xml, 6, null, null, 3, null);
+    }
+
+    // 起動のたびに呼ぶ。前の版の Run の登録をタスクへ移し、exe を動かしたときは場所を更新する。
+    public static void RefreshStartup()
+    {
+        try
+        {
+            if (HasTask() || HasRunValue()) { RegisterTask(); DeleteRunValue(); }
+        }
+        catch { } // タスクを作れないときは Run の登録をそのまま残す
+    }
+
+    bool IsStartup()
+    {
+        return HasTask() || HasRunValue();
+    }
+
     void ToggleStartup()
     {
-        using (var k = Registry.CurrentUser.CreateSubKey(RunKey))
+        try
         {
-            if (k.GetValue(RunName) != null) k.DeleteValue(RunName);
-            else k.SetValue(RunName, "\"" + Application.ExecutablePath + "\"");
+            if (IsStartup())
+            {
+                if (HasTask()) Com(TaskFolder(), "DeleteTask", TaskName, 0);
+                DeleteRunValue();
+            }
+            else RegisterTask();
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show("自動起動の設定を変えられませんでした。\n" + ex.Message, "DS4Battery");
         }
     }
 
@@ -602,6 +670,7 @@ class BatteryForm : Form
         {
             if (!created) return; // 2つ目は開かない
             Application.EnableVisualStyles();
+            BatteryForm.RefreshStartup();
             var r = new Reader();
             var t = new Thread(r.Run) { IsBackground = true };
             t.Start();
