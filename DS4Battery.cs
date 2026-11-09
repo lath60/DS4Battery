@@ -405,9 +405,10 @@ class BatteryForm : Form
         var t = new Thread(() =>
         {
             string err = Updater.Apply(rel);
+            if (err == null) err = Updater.LaunchNewOrRollback();
             BeginInvoke((Action)(() =>
             {
-                if (err == null) { Updater.LaunchNew(); Close(); return; }
+                if (err == null) { Close(); return; }
                 updating = false;
                 updateItem.Enabled = true;
                 updateItem.Text = "新しい版があります（v" + rel.Version + "）→ 更新する";
@@ -728,6 +729,8 @@ class BatteryForm : Form
     {
         // 更新の直後は、古い版が閉じるのを少し待つ
         bool afterUpdate = Array.IndexOf(args, "--after-update") >= 0;
+        // 更新の直後は「起動できた」と古い版へ知らせる。届かなければ古い版が元に戻す。
+        if (afterUpdate) { try { using (var ev = EventWaitHandle.OpenExisting(Updater.ReadyEvent)) ev.Set(); } catch { } }
         using (var m = new Mutex(false, "DS4Battery_single_instance"))
         {
             bool got;
@@ -753,7 +756,7 @@ class BatteryForm : Form
 // 動いている exe は上書きできないが名前は変えられるので、今の exe を .old にして新しい exe を置く。
 static class Updater
 {
-    public const string Current = "1.4.0";
+    public const string Current = "1.4.1";
     const string Api = "https://api.github.com/repos/lath60/DS4Battery/releases/latest";
     const string AssetName = "DS4Battery.exe";
 
@@ -848,6 +851,14 @@ static class Updater
             File.Move(exe, old);
             try { File.Move(neu, exe); }
             catch { File.Move(old, exe); throw; }
+
+            // ウイルス対策ソフトが置いた直後に消す・中身を変えることがあるので、少し待ってから確かめる
+            Thread.Sleep(2000);
+            if (!SameBytes(exe, bytes))
+            {
+                Rollback();
+                return "新しい版のファイルが消されました（ウイルス対策ソフトに止められた可能性があります）。元の版に戻しました。";
+            }
             return null;
         }
         catch (UnauthorizedAccessException)
@@ -862,24 +873,60 @@ static class Updater
         }
     }
 
-    public static void LaunchNew()
+    public const string ReadyEvent = "DS4Battery_update_ready";
+
+    static bool SameBytes(string path, byte[] expected)
     {
-        System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(Exe, "--after-update") { UseShellExecute = false });
+        try
+        {
+            var now = File.ReadAllBytes(path);
+            if (now.Length != expected.Length) return false;
+            for (int i = 0; i < now.Length; i++) if (now[i] != expected[i]) return false;
+            return true;
+        }
+        catch { return false; }
     }
 
-    // 前の更新で残った古い exe を消す（古い版が閉じきるまで少し待つ）
+    // 新しい exe を消して、.old を元の名前に戻す
+    static void Rollback()
+    {
+        string exe = Exe, old = exe + ".old";
+        for (int n = 0; n < 10; n++)
+        {
+            try
+            {
+                if (File.Exists(exe)) File.Delete(exe);
+                if (File.Exists(old)) File.Move(old, exe);
+                return;
+            }
+            catch { Thread.Sleep(500); }
+        }
+    }
+
+    // 新しい版を起動し、「起動できた」の知らせを待つ。届かなければ元の版に戻す。
+    // うまくいけば null（呼んだ側は自分を閉じる）、だめならその理由（呼んだ側はそのまま動き続ける）。
+    public static string LaunchNewOrRollback()
+    {
+        using (var ready = new EventWaitHandle(false, EventResetMode.ManualReset, ReadyEvent))
+        {
+            System.Diagnostics.Process p = null;
+            try
+            {
+                p = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(Exe, "--after-update") { UseShellExecute = false });
+            }
+            catch { }
+            if (p != null && ready.WaitOne(20000)) return null;
+
+            try { if (p != null && !p.HasExited) p.Kill(); } catch { }
+            Rollback();
+            return "新しい版を起動できませんでした（ウイルス対策ソフトに止められた可能性があります）。元の版に戻しました。";
+        }
+    }
+
+    // 前の更新で残った途中のファイルを消す。.old は、新しい版があとで消されたときの控えとして次の更新まで残す。
     public static void Cleanup()
     {
-        var t = new Thread(() =>
-        {
-            for (int n = 0; n < 20; n++)
-            {
-                if (!File.Exists(Exe + ".old") && !File.Exists(Exe + ".new")) return;
-                TryDelete(Exe + ".old"); TryDelete(Exe + ".new");
-                Thread.Sleep(500);
-            }
-        }) { IsBackground = true };
-        t.Start();
+        TryDelete(Exe + ".new");
     }
 
     static void TryDelete(string p) { try { if (File.Exists(p)) File.Delete(p); } catch { } }
