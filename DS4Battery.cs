@@ -560,11 +560,19 @@ class BatteryForm : Form
         timer.Tick += (s, e) =>
         {
             Render();
-            TopMost = true; // ほかのウィンドウに隠れたら前に出し直す
+            // ほかのウィンドウに隠れたら前に出し直す。TopMost = true は毎回 SetWindowPos を
+            // フォーカスを動かす形で呼ぶので、開いているフォントの画面などから入力を奪ってしまう。
+            // フォーカスを動かさない形（SWP_NOACTIVATE）で最前面に置き直す。
+            SetWindowPos(Handle, (IntPtr)(-1) /* HWND_TOPMOST */, 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0010 | 0x0200 /* NOSIZE|NOMOVE|NOACTIVATE|NOOWNERZORDER */);
             tip.SetToolTip(this, TooltipText());
         };
         timer.Start();
     }
+
+    [DllImport("user32.dll")]
+    static extern bool SetWindowPos(IntPtr hWnd, IntPtr after, int x, int y, int cx, int cy, uint flags);
+
+    protected override bool ShowWithoutActivation { get { return true; } }
 
     protected override CreateParams CreateParams
     {
@@ -1064,7 +1072,7 @@ class BatteryForm : Form
 // 動いている exe は上書きできないが名前は変えられるので、今の exe を .old にして新しい exe を置く。
 static class Updater
 {
-    public const string Current = "1.4.6";
+    public const string Current = "1.4.7";
     const string Api = "https://api.github.com/repos/lath60/DS4Battery/releases/latest";
     const string AssetName = "DS4Battery.exe";
 
