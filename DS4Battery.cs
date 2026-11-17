@@ -449,7 +449,12 @@ class BatteryForm : Form
         Location = LoadPosition();
         try { bgAlpha = Math.Max(1, Math.Min(255, int.Parse(File.ReadAllText(alphaPath).Trim()))); } catch { }
         stylePath = Path.Combine(Path.GetDirectoryName(settingsPath), "style.txt");
-        try { batteryStyle = Math.Max(0, Math.Min(2, int.Parse(File.ReadAllText(BatteryPath).Trim()))); } catch { }
+        // 電池の表示：初めて使う人はコントローラーの形。前から使っている人（設定のファイルがある人）は、
+        // 選び直していなければ前の既定の10マスのまま。
+        bool usedBefore = File.Exists(settingsPath) || File.Exists(alphaPath) || File.Exists(stylePath);
+        batteryStyle = File.Exists(BatteryPath) || !usedBefore ? 3 : 0;
+        try { batteryStyle = Math.Max(0, Math.Min(3, int.Parse(File.ReadAllText(BatteryPath).Trim()))); } catch { }
+        if (!usedBefore && !File.Exists(BatteryPath)) SaveBattery();   // 次に開いたときも同じ表示になるよう、最初に書いておく
         try
         {
             var p = File.ReadAllText(stylePath).Trim().Split(new[] { ',' }, 4);
@@ -527,7 +532,7 @@ class BatteryForm : Form
         menu.Items.Add(colorMenu);
 
         var batMenu = new ToolStripMenuItem("電池の表示");
-        foreach (var opt in new[] { Tuple.Create("10マス", 0), Tuple.Create("コンパクト", 1), Tuple.Create("電池の絵なし（文字だけ）", 2) })
+        foreach (var opt in new[] { Tuple.Create("コントローラー", 3), Tuple.Create("10マス", 0), Tuple.Create("コンパクト", 1), Tuple.Create("なし", 2) })
         {
             int v = opt.Item2;
             var it = new ToolStripMenuItem(opt.Item1, null, (s, e) => { batteryStyle = v; SaveBattery(); Render(); });
@@ -633,7 +638,7 @@ class BatteryForm : Form
     }
 
     int bgAlpha = 130;
-    int batteryStyle = 0;              // 0 いまの（10マス）／1 コンパクト／2 電池の絵なし
+    int batteryStyle = 0;              // 0 いまの（10マス）／1 コンパクト／2 電池の絵なし／3 コントローラーの形
 
     string BatteryPath { get { return Path.Combine(Path.GetDirectoryName(settingsPath), "battery.txt"); } }
 
@@ -868,14 +873,14 @@ class BatteryForm : Form
         if (st == Reader.Charging)
         {
             // 充電中の 10 は「まだ満充電ではない」＝実際は 90%台。満充電になると FULL に変わる。
-            text = lv >= 9 ? "90〜99%" : lv * 10 + "〜" + (lv * 10 + 9) + "%";
+            text = lv >= 9 ? "90-99%" : lv * 10 + "-" + (lv * 10 + 9) + "%";
             mark = MarkBolt;
             color = Color.FromArgb(90, 170, 255);
             return;
         }
         // つないでいるが本体が充電していない（充電しすぎを防いでいる）：盾＋チェックと外していたときの残量
         if (st == Reader.PluggedIdle) mark = MarkShield;
-        text = lv >= 10 ? "100%" : lv * 10 + "〜" + (lv * 10 + 9) + "%";
+        text = lv >= 10 ? "100%" : lv * 10 + "-" + (lv * 10 + 9) + "%";
         color = lv <= 1 ? Color.FromArgb(255, 70, 70) : lv <= 3 ? Color.FromArgb(255, 190, 60) : Color.FromArgb(80, 200, 120);
     }
 
@@ -890,6 +895,118 @@ class BatteryForm : Form
         return reader.Model + (link == "" ? "" : "（" + link + "）") + upd;
     }
 
+    // 未接続のときの絵：ゲームのコントローラーの形に「／」の斜線。幅 PadW×k、中心 (cx, cy)。
+    const float PadScale = 0.8f, PadW = 32f * PadScale;   // 絵は少し小さめ（電池の絵に近い高さ）
+
+    internal static void DrawPadOff(Graphics g, float cx, float cy, float u) { DrawPad(g, cx, cy, u, 0, Color.Empty, true); }
+
+    // コントローラーの絵。fill（0〜1）の分だけ左から中を color で塗る。slash で「／」を重ねる。
+    internal static void DrawPad(Graphics g, float cx, float cy, float u, float fill, Color color, bool slash)
+    {
+        cy -= 1.15f * u;   // 握りの分だけ下に長い形なので、見た目の上下の真ん中を cy に合わせる
+        Func<float, float, PointF> P = (x, y) => new PointF(cx + x * u, cy + y * u);
+        var round = System.Drawing.Drawing2D.LineCap.Round; var rj = System.Drawing.Drawing2D.LineJoin.Round;
+        var line = Color.FromArgb(200, 200, 200);
+        using (var pad = new System.Drawing.Drawing2D.GraphicsPath())
+        {
+            pad.AddLine(P(-8, -7), P(8, -7));
+            pad.AddBezier(P(8, -7), P(12, -7), P(14, -3.5f), P(15, 2.5f));      // 右の肩から握り
+            pad.AddBezier(P(15, 2.5f), P(16, 8.5f), P(10.5f, 9.5f), P(8.5f, 6)); // 右の握りの先
+            pad.AddBezier(P(8.5f, 6), P(6.5f, 3), P(4, 2.5f), P(0, 2.5f));       // 真ん中の下のくぼみ
+            pad.AddBezier(P(0, 2.5f), P(-4, 2.5f), P(-6.5f, 3), P(-8.5f, 6));
+            pad.AddBezier(P(-8.5f, 6), P(-10.5f, 9.5f), P(-16, 8.5f), P(-15, 2.5f));
+            pad.AddBezier(P(-15, 2.5f), P(-14, -3.5f), P(-12, -7), P(-8, -7));
+            pad.CloseFigure();
+            using (var sh = new Pen(Color.FromArgb(200, 0, 0, 0), 3.2f * u) { LineJoin = rj }) g.DrawPath(sh, pad);
+            if (fill > 0 && !color.IsEmpty)
+            {
+                // 残量：左から塗る（形の内側だけ）
+                var clip = g.Clip;
+                g.SetClip(pad, System.Drawing.Drawing2D.CombineMode.Intersect);
+                float left = cx - 15.6f * u, full = 31.2f * u;
+                using (var br = new SolidBrush(color)) g.FillRectangle(br, left, cy - 10 * u, full * Math.Min(1f, fill), 20 * u);
+                g.Clip = clip;
+            }
+            using (var pen = new Pen(line, 1.5f * u) { LineJoin = rj }) g.DrawPath(pen, pad);
+        }
+        // 十字キーとボタン（塗った上でも見えるよう黒いふちを付ける）
+        var dpad = new[] { new[] { P(-10.5f, -2.5f), P(-5.5f, -2.5f) }, new[] { P(-8, -5), P(-8, 0) } };
+        var btn = new[] { P(8, -5), P(8, 0), P(5.5f, -2.5f), P(10.5f, -2.5f) };
+        float r = 1.1f * u;
+        bool filled = fill > 0 && !color.IsEmpty;
+        if (filled)
+        {
+            using (var ol = new Pen(Color.FromArgb(170, 0, 0, 0), 2.6f * u) { StartCap = round, EndCap = round })
+                foreach (var d in dpad) g.DrawLine(ol, d[0], d[1]);
+            using (var ob = new SolidBrush(Color.FromArgb(170, 0, 0, 0)))
+                foreach (var d in btn) g.FillEllipse(ob, d.X - r - 0.6f * u, d.Y - r - 0.6f * u, 2 * r + 1.2f * u, 2 * r + 1.2f * u);
+        }
+        var mark = filled ? Color.White : line;
+        using (var pen = new Pen(mark, 1.4f * u) { StartCap = round, EndCap = round })
+            foreach (var d in dpad) g.DrawLine(pen, d[0], d[1]);
+        using (var dot = new SolidBrush(mark))
+            foreach (var d in btn) g.FillEllipse(dot, d.X - r, d.Y - r, 2 * r, 2 * r);
+        if (slash)
+        {
+            // 斜線「／」：黒いふちの上に赤
+            using (var ol = new Pen(Color.FromArgb(220, 0, 0, 0), 4.2f * u) { StartCap = round, EndCap = round }) g.DrawLine(ol, P(-11, 9), P(11, -9.5f));
+            using (var sl = new Pen(Color.FromArgb(235, 85, 85), 2.2f * u) { StartCap = round, EndCap = round }) g.DrawLine(sl, P(-11, 9), P(11, -9.5f));
+        }
+    }
+
+    // 残量の文字。末尾の「%」だけ少し小さく、数字と下の線（ベースライン）をそろえて描く。
+    const float PercentScale = 0.72f;
+
+    static Font PercentFont(Font Font)
+    {
+        try { return new Font(Font.FontFamily, Font.Size * PercentScale, Font.Style, Font.Unit); }
+        catch { return new Font(Font.Name, Font.Size * PercentScale, Font.Style, Font.Unit); }
+    }
+
+    static float Pad(Font f) { return f.SizeInPoints / 6f; }
+    // 数字と「%」のすき間：文字の大きさ「普通」で 2px（大きさに合わせて広がる）
+    static float PctGap(Graphics g, Font f) { return 2f * f.SizeInPoints / 10f * g.DpiX / 96f; }   // 文字の前後のすき間（いつもの MeasureString と同じくらい）
+
+    internal static float MeasureLevelText(Graphics g, Font Font, string text)
+    {
+        var tf = StringFormat.GenericTypographic;
+        if (!text.EndsWith("%") || text.Length < 2) return Pad(Font) * g.DpiX / 72f * 2 + g.MeasureString(text, Font, int.MaxValue, tf).Width;
+        string main = text.Substring(0, text.Length - 1);
+        using (var pf = PercentFont(Font))
+            return Pad(Font) * g.DpiX / 72f * 2 + g.MeasureString(main, Font, int.MaxValue, tf).Width - 0.06f * Font.SizeInPoints * g.DpiX / 72f + PctGap(g, Font)
+                + g.MeasureString("%", pf, int.MaxValue, tf).Width;
+    }
+
+    // cy：文字の上下の中心。字の形の実際の上端と下端（フォントごとの余白を除いたもの）の真ん中を cy に合わせる。
+    internal static void DrawLevelText(Graphics g, Font Font, string text, Brush br, float x, float cy)
+    {
+        var tf = StringFormat.GenericTypographic;
+        bool pct = text.EndsWith("%") && text.Length > 1;
+        string main = pct ? text.Substring(0, text.Length - 1) : text;
+        float px = x + Pad(Font) * g.DpiX / 72f;
+        float em = Font.SizeInPoints * g.DpiY / 72f;
+        float top = cy - g.MeasureString(main, Font, int.MaxValue, tf).Height / 2f;
+        try
+        {
+            using (var path = new System.Drawing.Drawing2D.GraphicsPath())
+            {
+                path.AddString(main, Font.FontFamily, (int)Font.Style, em, PointF.Empty, tf);
+                var b = path.GetBounds();
+                if (b.Height > 0) top = cy - (b.Y + b.Height / 2f);
+            }
+        }
+        catch { }
+        g.DrawString(main, Font, br, px, top, tf);
+        if (!pct) return;
+        float mw = g.MeasureString(main, Font, int.MaxValue, tf).Width - 0.06f * em + PctGap(g, Font);
+        using (var pf = PercentFont(Font))
+        {
+            // 「%」は数字と下の線（ベースライン）をそろえる
+            Func<Font, float> asc = f => f.SizeInPoints * g.DpiY / 72f * f.FontFamily.GetCellAscent(f.Style) / f.FontFamily.GetEmHeight(f.Style);
+            g.DrawString("%", pf, br, px + mw, top + asc(Font) - asc(pf), tf);
+        }
+    }
+
     // 背景は半透明・電池の絵と文字は不透明で描く（ピクセルごとの透明度）
     void Render()
     {
@@ -897,22 +1014,24 @@ class BatteryForm : Form
         string text; int seg; Color col; int mark;
         Describe(out text, out seg, out col, out mark);
         bool bolt = mark == MarkBolt;
+        bool off = !reader.Connected;           // 未接続：コントローラーの絵に斜線だけ（文字なし）
 
         float k = fontPt / 10f;                 // 文字の大きさに合わせて全体を拡大縮小
         // 電池の絵の幅：いまの（10マス）／コンパクト（小さい電池）／なし（文字だけ）
-        float bw = batteryStyle == 0 ? 44 * k : batteryStyle == 1 ? 22 * k : 0;
+        float bw = batteryStyle == 0 ? 44 * k : batteryStyle == 1 ? 22 * k : batteryStyle == 3 ? PadW * k : 0;
         float bh = batteryStyle == 0 ? 14 * k : 11 * k;
-        int bx = batteryStyle == 2 ? (int)(10 * k) : (int)(8 * k + bw + 9 * k);
+        int bx = batteryStyle == 2 ? (int)(10 * k) : batteryStyle == 3 ? (int)(8 * k + bw + 6 * k) : (int)(8 * k + bw + 9 * k);
         // 充電中は稲妻、つないで充電していないとき（充電しすぎを防いでいる）は盾＋チェック
         // 電池の絵があるときはマークを電池の上に重ね、絵がないときは文字の前に置く
         bool overlay = batteryStyle != 2;
         int tx = overlay ? bx : mark == MarkBolt ? bx + (int)(11 * k) : mark == MarkShield ? bx + (int)(14 * k) : bx;
         float markC = overlay ? 8 * k + bw / 2f : bx + 4.5f * k;          // マークの中心の x
-        float mu = overlay && batteryStyle == 1 ? 0.85f * k : k;          // コンパクトの電池は小さいので少し縮める
+        float mu = overlay && batteryStyle != 0 ? 0.85f * k : k;          // コンパクトの電池は小さいので少し縮める
+        if (off) tx = (int)(8 * k + PadW * k + (pending != null && !updating ? 3 * k : 0));   // 左右の余白をそろえる。更新の印があるときは少し空ける
         int w, h = (int)Math.Round(30 * k), textW;
         using (var tmp = new Bitmap(1, 1))
         using (var tg = Graphics.FromImage(tmp))
-            textW = (int)tg.MeasureString(text, Font).Width;
+            textW = off ? 0 : (int)Math.Ceiling(MeasureLevelText(tg, Font, text));
         // 新しい版があるときは、文字の右に小さな印（青い丸に上向きの矢印）を出す
         bool badge = pending != null && !updating;
         float bd = 12 * k, bdx = tx + textW - 1 * k;
@@ -940,7 +1059,12 @@ class BatteryForm : Form
                         using (var pen = new Pen(col, 2)) g.DrawPath(pen, path);
                 }
 
-                if (batteryStyle != 2)
+                if (off) DrawPadOff(g, 8 * k + PadW * k / 2f, h / 2f, PadScale * k);
+
+                if (batteryStyle == 3 && !off)
+                    DrawPad(g, 8 * k + PadW * k / 2f, h / 2f, PadScale * k, seg / 10f, col, false);
+
+                if (batteryStyle <= 1 && !off)
                 {
                     var body = new RectangleF(8 * k, (h - bh) / 2f, bw, bh);
                     using (var pen = new Pen(Color.FromArgb(220, 220, 220), 1.5f * k)) g.DrawRectangle(pen, body.X, body.Y, body.Width, body.Height);
@@ -983,7 +1107,7 @@ class BatteryForm : Form
                     if (overlay)
                     {
                         // 電池に重ねるときは盾を外し、黒いふち付きの白いチェックだけ（緑の電池に緑の盾は見分けにくい）
-                        float cu = batteryStyle == 1 ? 0.85f * k : k;
+                        float cu = batteryStyle != 0 ? 0.85f * k : k;
                         Func<float, float, PointF> Q = (x, y) => new PointF(c + x * cu, cy + y * cu);
                         var pts = new[] { Q(-3.6f, 0f), Q(-1f, 2.8f), Q(3.8f, -3f) };
                         var round = System.Drawing.Drawing2D.LineCap.Round; var rj = System.Drawing.Drawing2D.LineJoin.Round;
@@ -1008,11 +1132,12 @@ class BatteryForm : Form
                 }
 
                 // 文字（背景が薄くても読めるよう影を付ける）
-                var sz = g.MeasureString(text, Font);
-                float ty = (h - sz.Height) / 2f + 1;
                 Color fc = col == Color.Gray ? Color.Silver : textColor.IsEmpty ? col : textColor;
-                using (var sh = new SolidBrush(Color.FromArgb(200, 0, 0, 0))) g.DrawString(text, Font, sh, tx + 1, ty + 1);
-                using (var br = new SolidBrush(fc)) g.DrawString(text, Font, br, tx, ty);
+                if (!off)
+                {
+                    using (var sh = new SolidBrush(Color.FromArgb(200, 0, 0, 0))) DrawLevelText(g, Font, text, sh, tx + 1, h / 2f + 1);
+                    using (var br = new SolidBrush(fc)) DrawLevelText(g, Font, text, br, tx, h / 2f);
+                }
 
                 if (badge)
                 {
@@ -1072,7 +1197,7 @@ class BatteryForm : Form
 // 動いている exe は上書きできないが名前は変えられるので、今の exe を .old にして新しい exe を置く。
 static class Updater
 {
-    public const string Current = "1.4.7";
+    public const string Current = "1.5.0";
     const string Api = "https://api.github.com/repos/lath60/DS4Battery/releases/latest";
     const string AssetName = "DS4Battery.exe";
 
@@ -1371,7 +1496,7 @@ class FontPicker : Form
 
     FontStyle Wanted() { return (bold.Checked ? FontStyle.Bold : 0) | (italic.Checked ? FontStyle.Italic : 0); }
 
-    const string SampleText = "50〜59%  FULL";
+    const string SampleText = "50-59%  FULL";
 
     // 表示と同じ GDI+ の描き方で試しに描いてみて、だめなら使えないフォントとして扱う
     public static bool CanDraw(Font ft)
