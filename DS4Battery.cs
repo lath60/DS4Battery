@@ -454,7 +454,8 @@ class BatteryForm : Form
         bool usedBefore = File.Exists(settingsPath) || File.Exists(alphaPath) || File.Exists(stylePath);
         batteryStyle = File.Exists(BatteryPath) || !usedBefore ? 3 : 0;
         try { batteryStyle = Math.Max(0, Math.Min(3, int.Parse(File.ReadAllText(BatteryPath).Trim()))); } catch { }
-        if (!usedBefore && !File.Exists(BatteryPath)) SaveBattery();   // 次に開いたときも同じ表示になるよう、最初に書いておく
+        if (!usedBefore && !File.Exists(BatteryPath)) SaveBattery();
+        try { gaugeWhite = File.ReadAllText(GaugePath).Trim() != "color"; } catch { }   // 次に開いたときも同じ表示になるよう、最初に書いておく
         try
         {
             var p = File.ReadAllText(stylePath).Trim().Split(new[] { ',' }, 4);
@@ -541,6 +542,17 @@ class BatteryForm : Form
         }
         batMenu.DropDownOpening += (s, e) => { foreach (ToolStripMenuItem it in batMenu.DropDownItems) it.Checked = (int)it.Tag == batteryStyle; };
         menu.Items.Add(batMenu);
+
+        var gaugeMenu = new ToolStripMenuItem("ゲージの色");
+        foreach (var opt in new[] { Tuple.Create("白", true), Tuple.Create("残量の色（緑・黄・赤）", false) })
+        {
+            bool v = opt.Item2;
+            var it = new ToolStripMenuItem(opt.Item1, null, (s, e) => { gaugeWhite = v; SaveGauge(); Render(); });
+            it.Tag = v;
+            gaugeMenu.DropDownItems.Add(it);
+        }
+        gaugeMenu.DropDownOpening += (s, e) => { foreach (ToolStripMenuItem it in gaugeMenu.DropDownItems) it.Checked = (bool)it.Tag == gaugeWhite; };
+        menu.Items.Add(gaugeMenu);
         startupItem = new ToolStripMenuItem("Windows の起動時に自動で開く", null, (s, e) => ToggleStartup());
         menu.Items.Add(startupItem);
         menu.Items.Add(new ToolStripSeparator());
@@ -641,6 +653,13 @@ class BatteryForm : Form
     int batteryStyle = 0;              // 0 いまの（10マス）／1 コンパクト／2 電池の絵なし／3 コントローラーの形
 
     string BatteryPath { get { return Path.Combine(Path.GetDirectoryName(settingsPath), "battery.txt"); } }
+    bool gaugeWhite = true;            // 残量のゲージ：白一色（既定）／残量の色（緑・黄・赤・充電中の青）
+    string GaugePath { get { return Path.Combine(Path.GetDirectoryName(settingsPath), "gauge.txt"); } }
+    void SaveGauge()
+    {
+        try { Directory.CreateDirectory(Path.GetDirectoryName(settingsPath)); File.WriteAllText(GaugePath, gaugeWhite ? "white" : "color"); } catch { }
+    }
+    static readonly Color GaugeWhite = Color.FromArgb(235, 235, 235);
 
     void SaveBattery()
     {
@@ -898,10 +917,11 @@ class BatteryForm : Form
     // 未接続のときの絵：ゲームのコントローラーの形に「／」の斜線。幅 PadW×k、中心 (cx, cy)。
     const float PadScale = 0.8f, PadW = 32f * PadScale;   // 絵は少し小さめ（電池の絵に近い高さ）
 
-    internal static void DrawPadOff(Graphics g, float cx, float cy, float u) { DrawPad(g, cx, cy, u, 0, Color.Empty, true); }
+    internal static void DrawPadOff(Graphics g, float cx, float cy, float u, bool details = true) { DrawPad(g, cx, cy, u, 0, Color.Empty, true, details); }
 
     // コントローラーの絵。fill（0〜1）の分だけ左から中を color で塗る。slash で「／」を重ねる。
-    internal static void DrawPad(Graphics g, float cx, float cy, float u, float fill, Color color, bool slash)
+    // details：十字キーとボタンを描くか（小さい表示ではつぶれるので描かない）
+    internal static void DrawPad(Graphics g, float cx, float cy, float u, float fill, Color color, bool slash, bool details = true)
     {
         cy -= 1.15f * u;   // 握りの分だけ下に長い形なので、見た目の上下の真ん中を cy に合わせる
         Func<float, float, PointF> P = (x, y) => new PointF(cx + x * u, cy + y * u);
@@ -930,22 +950,25 @@ class BatteryForm : Form
             using (var pen = new Pen(line, 1.5f * u) { LineJoin = rj }) g.DrawPath(pen, pad);
         }
         // 十字キーとボタン（塗った上でも見えるよう黒いふちを付ける）
-        var dpad = new[] { new[] { P(-10.5f, -2.5f), P(-5.5f, -2.5f) }, new[] { P(-8, -5), P(-8, 0) } };
-        var btn = new[] { P(8, -5), P(8, 0), P(5.5f, -2.5f), P(10.5f, -2.5f) };
-        float r = 1.1f * u;
-        bool filled = fill > 0 && !color.IsEmpty;
-        if (filled)
+        if (details)
         {
-            using (var ol = new Pen(Color.FromArgb(170, 0, 0, 0), 2.6f * u) { StartCap = round, EndCap = round })
-                foreach (var d in dpad) g.DrawLine(ol, d[0], d[1]);
-            using (var ob = new SolidBrush(Color.FromArgb(170, 0, 0, 0)))
-                foreach (var d in btn) g.FillEllipse(ob, d.X - r - 0.6f * u, d.Y - r - 0.6f * u, 2 * r + 1.2f * u, 2 * r + 1.2f * u);
+            var dpad = new[] { new[] { P(-10.5f, -2.5f), P(-5.5f, -2.5f) }, new[] { P(-8, -5), P(-8, 0) } };
+            var btn = new[] { P(8, -5), P(8, 0), P(5.5f, -2.5f), P(10.5f, -2.5f) };
+            float r = 1.1f * u;
+            bool filled = fill > 0 && !color.IsEmpty;
+            if (filled)
+            {
+                using (var ol = new Pen(Color.FromArgb(170, 0, 0, 0), 2.6f * u) { StartCap = round, EndCap = round })
+                    foreach (var d in dpad) g.DrawLine(ol, d[0], d[1]);
+                using (var ob = new SolidBrush(Color.FromArgb(170, 0, 0, 0)))
+                    foreach (var d in btn) g.FillEllipse(ob, d.X - r - 0.6f * u, d.Y - r - 0.6f * u, 2 * r + 1.2f * u, 2 * r + 1.2f * u);
+            }
+            var mark = filled ? Color.White : line;
+            using (var pen = new Pen(mark, 1.4f * u) { StartCap = round, EndCap = round })
+                foreach (var d in dpad) g.DrawLine(pen, d[0], d[1]);
+            using (var dot = new SolidBrush(mark))
+                foreach (var d in btn) g.FillEllipse(dot, d.X - r, d.Y - r, 2 * r, 2 * r);
         }
-        var mark = filled ? Color.White : line;
-        using (var pen = new Pen(mark, 1.4f * u) { StartCap = round, EndCap = round })
-            foreach (var d in dpad) g.DrawLine(pen, d[0], d[1]);
-        using (var dot = new SolidBrush(mark))
-            foreach (var d in btn) g.FillEllipse(dot, d.X - r, d.Y - r, 2 * r, 2 * r);
         if (slash)
         {
             // 斜線「／」：黒いふちの上に赤
@@ -1013,8 +1036,13 @@ class BatteryForm : Form
         if (!IsHandleCreated) return;
         string text; int seg; Color col; int mark;
         Describe(out text, out seg, out col, out mark);
+        using (var bmp = Compose(text, seg, col, mark, !reader.Connected)) Push(bmp);
+    }
+
+    // 表示の絵を作る（README の見本づくりからも呼ぶ）。off＝未接続：コントローラーの絵に斜線だけ（文字なし）
+    internal Bitmap Compose(string text, int seg, Color col, int mark, bool off)
+    {
         bool bolt = mark == MarkBolt;
-        bool off = !reader.Connected;           // 未接続：コントローラーの絵に斜線だけ（文字なし）
 
         float k = fontPt / 10f;                 // 文字の大きさに合わせて全体を拡大縮小
         // 電池の絵の幅：いまの（10マス）／コンパクト（小さい電池）／なし（文字だけ）
@@ -1039,7 +1067,7 @@ class BatteryForm : Form
         badgeRect = badge ? new RectangleF(bdx, (h - bd) / 2f, bd, bd) : RectangleF.Empty;
         if (Width != w || Height != h) Size = new Size(w, h);
 
-        using (var bmp = new Bitmap(w, h, System.Drawing.Imaging.PixelFormat.Format32bppPArgb))
+        var bmp = new Bitmap(w, h, System.Drawing.Imaging.PixelFormat.Format32bppPArgb);
         {
             using (var g = Graphics.FromImage(bmp))
             {
@@ -1059,10 +1087,12 @@ class BatteryForm : Form
                         using (var pen = new Pen(col, 2)) g.DrawPath(pen, path);
                 }
 
-                if (off) DrawPadOff(g, 8 * k + PadW * k / 2f, h / 2f, PadScale * k);
+                bool details = fontPt > 10.5f;                        // 「普通」「小」では十字キーとボタンを描かない
+                Color gauge = gaugeWhite && col != Color.Gray ? GaugeWhite : col;
+                if (off) DrawPadOff(g, 8 * k + PadW * k / 2f, h / 2f, PadScale * k, details);
 
                 if (batteryStyle == 3 && !off)
-                    DrawPad(g, 8 * k + PadW * k / 2f, h / 2f, PadScale * k, seg / 10f, col, false);
+                    DrawPad(g, 8 * k + PadW * k / 2f, h / 2f, PadScale * k, seg / 10f, gauge, false, details);
 
                 if (batteryStyle <= 1 && !off)
                 {
@@ -1070,7 +1100,7 @@ class BatteryForm : Form
                     using (var pen = new Pen(Color.FromArgb(220, 220, 220), 1.5f * k)) g.DrawRectangle(pen, body.X, body.Y, body.Width, body.Height);
                     using (var nub = new SolidBrush(Color.FromArgb(220, 220, 220)))
                         g.FillRectangle(nub, body.Right + 1 * k, body.Y + bh * 0.3f, 2.5f * k, bh * 0.4f);
-                    using (var br = new SolidBrush(col))
+                    using (var br = new SolidBrush(gauge))
                     {
                         if (batteryStyle == 0)
                         {
@@ -1112,7 +1142,8 @@ class BatteryForm : Form
                         var pts = new[] { Q(-3.6f, 0f), Q(-1f, 2.8f), Q(3.8f, -3f) };
                         var round = System.Drawing.Drawing2D.LineCap.Round; var rj = System.Drawing.Drawing2D.LineJoin.Round;
                         using (var ol = new Pen(Color.FromArgb(220, 0, 0, 0), 4.2f * cu) { StartCap = round, EndCap = round, LineJoin = rj }) g.DrawLines(ol, pts);
-                        using (var ck = new Pen(Color.White, 2.2f * cu) { StartCap = round, EndCap = round, LineJoin = rj }) g.DrawLines(ck, pts);
+                        using (var ck = new Pen(gaugeWhite ? Color.FromArgb(80, 200, 120) : Color.White, 2.2f * cu) {   // 白いゲージの上では緑のチェック
+                             StartCap = round, EndCap = round, LineJoin = rj }) g.DrawLines(ck, pts);
                     }
                     else
                     {
@@ -1153,16 +1184,21 @@ class BatteryForm : Form
                 }
             }
 
-            IntPtr screen = GetDC(IntPtr.Zero), mem = CreateCompatibleDC(screen);
-            IntPtr hbmp = bmp.GetHbitmap(Color.FromArgb(0)), old = SelectObject(mem, hbmp);
-            try
-            {
-                var size = new SZ { W = w, H = h }; var src = new PT();
-                var blend = new BLEND { Op = 0, Flags = 0, Alpha = 255, Format = 1 /* AC_SRC_ALPHA */ };
-                UpdateLayeredWindow(Handle, screen, IntPtr.Zero, ref size, mem, ref src, 0, ref blend, 2 /* ULW_ALPHA */);
-            }
-            finally { SelectObject(mem, old); DeleteObject(hbmp); DeleteDC(mem); ReleaseDC(IntPtr.Zero, screen); }
         }
+        return bmp;
+    }
+
+    void Push(Bitmap bmp)
+    {
+        IntPtr screen = GetDC(IntPtr.Zero), mem = CreateCompatibleDC(screen);
+        IntPtr hbmp = bmp.GetHbitmap(Color.FromArgb(0)), old = SelectObject(mem, hbmp);
+        try
+        {
+            var size = new SZ { W = bmp.Width, H = bmp.Height }; var src = new PT();
+            var blend = new BLEND { Op = 0, Flags = 0, Alpha = 255, Format = 1 /* AC_SRC_ALPHA */ };
+            UpdateLayeredWindow(Handle, screen, IntPtr.Zero, ref size, mem, ref src, 0, ref blend, 2 /* ULW_ALPHA */);
+        }
+        finally { SelectObject(mem, old); DeleteObject(hbmp); DeleteDC(mem); ReleaseDC(IntPtr.Zero, screen); }
     }
 
     [STAThread]
@@ -1197,7 +1233,7 @@ class BatteryForm : Form
 // 動いている exe は上書きできないが名前は変えられるので、今の exe を .old にして新しい exe を置く。
 static class Updater
 {
-    public const string Current = "1.5.0";
+    public const string Current = "1.5.1";
     const string Api = "https://api.github.com/repos/lath60/DS4Battery/releases/latest";
     const string AssetName = "DS4Battery.exe";
 
